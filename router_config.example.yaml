@@ -1,0 +1,64 @@
+classifier:
+  model: qwen2.5:3b                    # Small, fast model for classification
+  base_url: http://YOUR_OLLAMA_HOST:11434/v1
+  api_key_env: ''                       # env var name for API key, or '' for none
+  system_prompt: |
+    Classify as "simple" or "complex".
+
+    "Hello" → simple
+    "Implement OAuth2" → complex
+    "Thanks!" → simple
+    "Debug nginx 502" → complex
+    "What is Docker?" → simple
+    "Deploy K8s cluster" → complex
+    "Say hi" → simple
+    "Write integration tests" → complex
+    "Refactor to async" → complex
+
+    SIMPLE = hi, thanks, what is, how are you, trivia, status check.
+    COMPLEX = implement, debug, deploy, refactor, build, configure, code, write, create.
+
+    "{message}" →
+  session_timeout_minutes: 5           # cache classification per session
+
+models:
+  simple:
+    model: YOUR_FAST_MODEL             # e.g. deepseek-v4-flash, gpt-4o-mini
+    base_url: https://YOUR_SIMPLE_PROVIDER/v1
+    api_key_env: SIMPLE_API_KEY
+    timeout_seconds: 120
+  complex:
+    model: YOUR_SMART_MODEL            # e.g. deepseek-v4-pro, claude-sonnet-4
+    base_url: https://YOUR_COMPLEX_PROVIDER/v1
+    api_key_env: COMPLEX_API_KEY
+    timeout_seconds: 300
+    fallback_model: YOUR_FALLBACK_MODEL
+    fallback_base_url: https://YOUR_FALLBACK_PROVIDER/v1
+    fallback_key_env: FALLBACK_API_KEY
+
+routing:
+  escalation_keywords:                 # keyword-based override → complex
+  - implement
+  - refactor
+  - build
+  - deploy
+  - debug
+  - fix this
+  - migrate
+  - set up
+  - configure
+  - dockerfile
+  - kubernetes
+  - write tests
+  - code review
+  de_escalation_keywords:              # keyword-based override → simple
+  - thanks
+  - got it
+  - what is
+  - how are you
+  - lol
+  - good morning
+
+server:
+  port: 8766
+  host: 0.0.0.0

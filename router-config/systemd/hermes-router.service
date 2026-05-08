@@ -1,0 +1,18 @@
+[Unit]
+Description=Hermes Model Router (flash-classifier + keyword-pipe proxy)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/root/.hermes/hermes-agent/venv/bin/python /root/router-proxy/server.py
+WorkingDirectory=/root/router-proxy
+EnvironmentFile=%h/.hermes/.env
+Restart=on-failure
+RestartSec=10
+KillMode=process
+KillSignal=SIGTERM
+TimeoutStopSec=10
+
+[Install]
+WantedBy=default.target

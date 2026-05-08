@@ -1,0 +1,17 @@
+# Router config (contains user-specific endpoints/keys)
+router_config.yaml
+
+# Python
+__pycache__/
+*.pyc
+
+# Environment
+.env
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
