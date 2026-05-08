@@ -53,7 +53,7 @@ def load_config() -> dict[str, Any]:
 
 def env_key(name: str) -> str:
     """Read an API key from the environment.  Returns empty string on miss."""
-    return os.environ.get(name, "")
+    return os.environ.get(name, "").strip()
 
 
 # ── Profile Hint (lazy extraction) ──────────────────────────────────────────
