@@ -306,6 +306,9 @@ def call_model(
     alt_key = env_key(model_cfg.get("alternate_key_env", ""))
 
     payload = {**request_payload, "model": model_cfg["model"]}
+    # Router proxy doesn't support streaming — force non-streaming for JSON parsing.
+    payload.pop("stream", None)
+    payload.pop("stream_options", None)
     headers: dict[str, str] = {"Content-Type": "application/json"}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
