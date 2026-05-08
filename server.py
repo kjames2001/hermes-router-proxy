@@ -28,7 +28,7 @@ from typing import Any
 import httpx
 import yaml
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 # ── Logging ─────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -306,9 +306,6 @@ def call_model(
     alt_key = env_key(model_cfg.get("alternate_key_env", ""))
 
     payload = {**request_payload, "model": model_cfg["model"]}
-    # Router proxy doesn't support streaming — force non-streaming for JSON parsing.
-    payload.pop("stream", None)
-    payload.pop("stream_options", None)
     headers: dict[str, str] = {"Content-Type": "application/json"}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
@@ -336,6 +333,161 @@ def call_model(
             log.info("Alternate key succeeded")
 
     return resp
+
+
+async def call_model_stream(model_cfg: dict, request_payload: dict):
+    """Async generator that yields SSE chunks from an upstream model."""
+    url = f"{model_cfg['base_url'].rstrip('/')}/chat/completions"
+    api_key = env_key(model_cfg["api_key_env"])
+    timeout = model_cfg.get("timeout_seconds", 120)
+
+    payload = {**request_payload, "model": model_cfg["model"]}
+    headers: dict[str, str] = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    async with httpx.AsyncClient() as client:
+        async with client.stream(
+            "POST", url, json=payload, headers=headers,
+            timeout=httpx.Timeout(timeout),
+        ) as resp:
+            if resp.status_code != 200:
+                body = await resp.aread()
+                yield f'data: {{"error":{{"message":"Upstream {resp.status_code}: {body.decode(errors="replace")[:300]}","type":"upstream_error"}}}}\n\n'.encode()
+                yield b'data: [DONE]\n\n'
+                return
+
+            async for line in resp.aiter_lines():
+                if line and line.startswith("data: "):
+                    yield f"{line}\n".encode()
+                elif line.strip() == "":
+                    yield b"\n"
+
+        # Add router metadata to final chunk
+        yield b''  # sentinel - metadata handled by wrapper
+
+
+async def route_request_stream(cfg: dict, payload: dict):
+    """Streaming version of route_request — returns SSE chunks from upstream."""
+    messages = payload.get("messages", [])
+    key = session_key(messages)
+    if not key:
+        yield b'data: {"error":{"message":"No user message found","type":"router_error"}}\n\ndata: [DONE]\n\n'
+        return
+
+    # ── Determine tier (reuse sync logic from cache) ──────────────────
+    tier: str
+    if is_first_message(messages):
+        user_content = _last_user_text(messages)
+        tier = classify(cfg, user_content)
+        cache_tier(key, tier)
+    else:
+        cached = get_cached_tier(cfg, key)
+        if cached is None:
+            user_content = _last_user_text(messages)
+            tier = classify(cfg, user_content)
+            cache_tier(key, tier)
+        else:
+            last_text = _last_user_text(messages)
+            if has_deviation(cfg, last_text, cached):
+                user_content = _last_user_text(messages)
+                tier = classify(cfg, user_content)
+                cache_tier(key, tier)
+            else:
+                tier = cached
+
+    model_cfg = cfg["models"][tier]
+    log.info("Streaming session %s → %s (%s)", key, tier, model_cfg["model"])
+
+    # Try primary first
+    async with httpx.AsyncClient() as client:
+        url = f"{model_cfg['base_url'].rstrip('/')}/chat/completions"
+        api_key = env_key(model_cfg["api_key_env"])
+        timeout = model_cfg.get("timeout_seconds", 120)
+        alt_key = env_key(model_cfg.get("alternate_key_env", ""))
+
+        stream_payload = {**payload, "model": model_cfg["model"]}
+        headers: dict[str, str] = {"Content-Type": "application/json"}
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+
+        async with client.stream(
+            "POST", url, json=stream_payload, headers=headers,
+            timeout=httpx.Timeout(timeout),
+        ) as resp:
+            if resp.status_code == 200:
+                # Primary succeeded — forward SSE stream
+                log.info("Streaming primary %s OK", model_cfg["model"])
+                async for line in resp.aiter_lines():
+                    if line:
+                        yield f"{line}\n".encode()
+                    else:
+                        yield b"\n"
+                return
+
+            # Primary failed — try alternate key if 429
+            if resp.status_code == 429 and alt_key:
+                log.warning("Primary key rate-limited (429) - switching to alternate key")
+                alt_headers = {
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {alt_key}",
+                }
+                async with client.stream(
+                    "POST", url, json=stream_payload, headers=alt_headers,
+                    timeout=httpx.Timeout(timeout),
+                ) as resp2:
+                    if resp2.status_code == 200:
+                        log.info("Alternate key succeeded")
+                        async for line in resp2.aiter_lines():
+                            if line:
+                                yield f"{line}\n".encode()
+                            else:
+                                yield b"\n"
+                        return
+
+            # Primary + alt key failed — try fallback
+            fallback_model = model_cfg.get("fallback_model")
+            if fallback_model:
+                log.warning(
+                    "Primary %s returned %d — streaming fallback to %s",
+                    model_cfg["model"], resp.status_code, fallback_model,
+                )
+                fb_cfg = {
+                    "model": fallback_model,
+                    "base_url": model_cfg["fallback_base_url"],
+                    "api_key_env": model_cfg["fallback_key_env"],
+                    "timeout_seconds": model_cfg.get("timeout_seconds", 120),
+                }
+                fb_url = f"{fb_cfg['base_url'].rstrip('/')}/chat/completions"
+                fb_key = env_key(fb_cfg["api_key_env"])
+                fb_headers: dict[str, str] = {"Content-Type": "application/json"}
+                if fb_key:
+                    fb_headers["Authorization"] = f"Bearer {fb_key}"
+                fb_payload = {**payload, "model": fb_cfg["model"]}
+
+                async with client.stream(
+                    "POST", fb_url, json=fb_payload, headers=fb_headers,
+                    timeout=httpx.Timeout(fb_cfg["timeout_seconds"]),
+                ) as fb_resp:
+                    if fb_resp.status_code == 200:
+                        log.info("Streaming fallback %s OK", fallback_model)
+                        async for line in fb_resp.aiter_lines():
+                            if line:
+                                yield f"{line}\n".encode()
+                            else:
+                                yield b"\n"
+                        return
+                    else:
+                        fb_body = await fb_resp.aread()
+                        error_msg = fb_body.decode(errors="replace")[:300]
+                        yield f'data: {{"error":{{"message":"Fallback {fallback_model} failed: {resp.status_code}/{fb_resp.status_code} - {error_msg}","type":"upstream_error"}}}}\n\n'.encode()
+                        yield b'data: [DONE]\n\n'
+                        return
+            else:
+                body = await resp.aread()
+                error_msg = body.decode(errors="replace")[:300]
+                yield f'data: {{"error":{{"message":"Upstream {model_cfg["model"]} returned {resp.status_code}: {error_msg}","type":"upstream_error"}}}}\n\n'.encode()
+                yield b'data: [DONE]\n\n'
 
 
 def route_request(cfg: dict, payload: dict) -> JSONResponse:
@@ -491,6 +643,11 @@ async def chat_completions(request: Request):
     """OpenAI-compatible chat completions — routed automatically."""
     cfg = app.state.config
     payload = await request.json()
+    if payload.get("stream"):
+        return StreamingResponse(
+            route_request_stream(cfg, payload),
+            media_type="text/event-stream",
+        )
     return route_request(cfg, payload)
 
 
