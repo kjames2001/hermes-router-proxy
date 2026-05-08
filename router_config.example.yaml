@@ -2,6 +2,7 @@ classifier:
   model: qwen2.5:3b                    # Small, fast model for classification
   base_url: http://YOUR_OLLAMA_HOST:11434/v1
   api_key_env: ''                       # env var name for API key, or '' for none
+  profile_hint: ''                      # Auto-filled from SOUL.md on first run
   system_prompt: |
     Classify as "simple" or "complex".
 
@@ -37,28 +38,228 @@ models:
     fallback_key_env: FALLBACK_API_KEY
 
 routing:
-  escalation_keywords:                 # keyword-based override → complex
-  - implement
-  - refactor
-  - build
-  - deploy
-  - debug
-  - fix this
-  - migrate
-  - set up
-  - configure
-  - dockerfile
-  - kubernetes
-  - write tests
-  - code review
-  de_escalation_keywords:              # keyword-based override → simple
-  - thanks
-  - got it
-  - what is
-  - how are you
-  - lol
-  - good morning
+  escalation_keywords:                 # keywords that force → complex
+    # ── Code & Development ──
+    - implement
+    - refactor
+    - build
+    - write code
+    - generate code
+    - code review
+    - write tests
+    - unit test
+    - integration test
+    - create a PR
+    - merge conflict
+    - rebase
+    - dependency
+    - pip install
+    - requirements.txt
+    - function
+    - decorator
+    - async
+    - await
+    - regex
+    - middleware
+    - endpoint
+    - REST API
+    - GraphQL
+    - webhook
+    - OAuth
+    - JWT
+    - authentication
+    - authorization
+    # ── Infrastructure & DevOps ──
+    - deploy
+    - configure
+    - set up
+    - migrate
+    - proxmox
+    - LXC
+    - container
+    - dockerfile
+    - docker-compose
+    - docker compose
+    - kubernetes
+    - k8s
+    - helm
+    - namespace
+    - ingress
+    - reverse proxy
+    - nginx
+    - caddy
+    - traefik
+    - systemd service
+    - systemctl
+    - cron job
+    - crontab
+    - firewall
+    - iptables
+    - DNS
+    - SSL
+    - TLS
+    - certificate
+    - certbot
+    - tailscale
+    - wireguard
+    - VPN
+    - SSH key
+    - rsync
+    - backup
+    - restore backup
+    - snapshot
+    # ── Debugging & Troubleshooting ──
+    - debug
+    - troubleshoot
+    - diagnose
+    - fix this
+    - fix the
+    - not working
+    - why isn't
+    - what's wrong
+    - error
+    - crash
+    - exception
+    - traceback
+    - stack trace
+    - segfault
+    - 502
+    - 500 error
+    - 503
+    - connection refused
+    - timeout
+    - permission denied
+    - OOM
+    - out of memory
+    - disk full
+    - memory leak
+    - deadlock
+    - race condition
+    # ── Architecture & Design ──
+    - architect
+    - design a
+    - write a plan
+    - optimize
+    - scale
+    - rate limit
+    - cache strategy
+    - CDN
+    - security review
+    - vulnerability
+    # ── Data & Databases ──
+    - database schema
+    - SQL
+    - query
+    - migration
+    - indexing
+    - ChromaDB
+    - vector store
+    - embedding
+    - similarity search
+    # ── Automation & Orchestration ──
+    - automate
+    - automation
+    - script
+    - pipeline
+    - CI/CD
+    - GitHub Actions
+    - workflow
+    - trigger
+    - scheduler
+    - cron
+    - message queue
+    - MQTT
+    - Home Assistant
+    - HA automation
+    - blueprint
+    - ESPHome
+    - zigbee
+    - ZHA
+    - Z2M
+    # ── AI/ML ──
+    - fine-tune
+    - training
+    - model
+    - inference
+    - quantize
+    - GGUF
+    - LoRA
+    - DPO
+    - GRPO
+    - RAG
+    - tokenizer
+    - vLLM
+    - Ollama
+    - ComfyUI
+    - agent
+    - multi-agent
+    - tool calling
+    - function calling
+    - structured output
+    - Pydantic
+  de_escalation_keywords:              # keywords that force → simple
+    # ── Acknowledgments ──
+    - thanks
+    - thank you
+    - thx
+    - ty
+    - got it
+    - understood
+    - makes sense
+    - perfect
+    - nice
+    - cool
+    - awesome
+    - great
+    - amazing
+    - cheers
+    # ── Casual Greetings/Chat ──
+    - good morning
+    - good afternoon
+    - good evening
+    - good night
+    - hello
+    - hey
+    - hi
+    - how are you
+    - what's up
+    - morning
+    - evening
+    - bye
+    - goodbye
+    - see you
+    - take care
+    # ── Simple Definitions ──
+    - what does
+    - what is
+    - define
+    - definition of
+    - explain simply
+    - how do I spell
+    # ── Casual Reactions ──
+    - lol
+    - lmao
+    - haha
+    - ok
+    - okay
+    - sure
+    - yep
+    - yeah
+    - nah
+    - yup
+    # ── Quick Checks ──
+    - what time
+    - what day
+    - what date
+    - what's the weather
+    - status check
+    - is it up
+    - uptime
 
 server:
   port: 8766
   host: 0.0.0.0
+
+persona:
+  soul_path: ~/.hermes/SOUL.md         # Path to agent persona file
+  max_context_chars: 800               # Max chars to read for profile hint
