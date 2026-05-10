@@ -480,9 +480,47 @@ async def route_request_stream(cfg: dict, payload: dict):
                     else:
                         fb_body = await fb_resp.aread()
                         error_msg = fb_body.decode(errors="replace")[:300]
-                        yield f'data: {{"error":{{"message":"Fallback {fallback_model} failed: {resp.status_code}/{fb_resp.status_code} - {error_msg}","type":"upstream_error"}}}}\n\n'.encode()
-                        yield b'data: [DONE]\n\n'
-                        return
+                        # Fallback 1 failed — try fallback 2
+                        fb2_model = model_cfg.get("fallback2_model")
+                        if fb2_model:
+                            log.warning(
+                                "Fallback %s returned %d — trying fallback2 %s",
+                                fallback_model, fb_resp.status_code, fb2_model,
+                            )
+                            fb2_cfg = {
+                                "model": fb2_model,
+                                "base_url": model_cfg["fallback2_base_url"],
+                                "api_key_env": model_cfg["fallback2_key_env"],
+                                "timeout_seconds": model_cfg.get("timeout_seconds", 120),
+                            }
+                            fb2_url = f"{fb2_cfg['base_url'].rstrip('/')}/chat/completions"
+                            fb2_key = env_key(fb2_cfg["api_key_env"])
+                            fb2_headers: dict[str, str] = {"Content-Type": "application/json"}
+                            if fb2_key:
+                                fb2_headers["Authorization"] = f"Bearer {fb2_key}"
+                            fb2_payload = {**payload, "model": fb2_cfg["model"]}
+                            async with client.stream(
+                                "POST", fb2_url, json=fb2_payload, headers=fb2_headers,
+                                timeout=httpx.Timeout(fb2_cfg["timeout_seconds"]),
+                            ) as fb2_resp:
+                                if fb2_resp.status_code == 200:
+                                    log.info("Streaming fallback2 %s OK", fb2_model)
+                                    async for line in fb2_resp.aiter_lines():
+                                        if line:
+                                            yield f"{line}\n".encode()
+                                        else:
+                                            yield b"\n"
+                                    return
+                                else:
+                                    fb2_body = await fb2_resp.aread()
+                                    fb2_error = fb2_body.decode(errors="replace")[:200]
+                                    yield f'data: {{"error":{{"message":"Fallbacks exhausted: {fallback_model}({fb_resp.status_code}), {fb2_model}({fb2_resp.status_code}) - {fb2_error}","type":"upstream_error"}}}}\n\n'.encode()
+                                    yield b'data: [DONE]\n\n'
+                                    return
+                        else:
+                            yield f'data: {{"error":{{"message":"Fallback {fallback_model} failed: {resp.status_code}/{fb_resp.status_code} - {error_msg}","type":"upstream_error"}}}}\n\n'.encode()
+                            yield b'data: [DONE]\n\n'
+                            return
             else:
                 body = await resp.aread()
                 error_msg = body.decode(errors="replace")[:300]
@@ -570,6 +608,26 @@ def route_request(cfg: dict, payload: dict) -> JSONResponse:
         data.setdefault("hermes_router", {})["fallback_used"] = True
         return JSONResponse(content=data)
 
+    # ── Fallback 2 ─────────────────────────────────────────────────────────
+    fb2_model = model_cfg.get("fallback2_model")
+    if fb2_model:
+        log.warning(
+            "Fallback %s returned %d — trying fallback2 %s",
+            fallback_model, fb_resp.status_code, fb2_model,
+        )
+        fb2_cfg = {
+            "model": fb2_model,
+            "base_url": model_cfg["fallback2_base_url"],
+            "api_key_env": model_cfg["fallback2_key_env"],
+            "timeout_seconds": model_cfg.get("timeout_seconds", 120),
+        }
+        fb2_resp = call_model(fb2_cfg, payload)
+        if fb2_resp.status_code == 200:
+            data = fb2_resp.json()
+            data.setdefault("hermes_router", {})["fallback_used"] = True
+            return JSONResponse(content=data)
+        return _proxy_error(fb2_resp)
+
     return _proxy_error(fb_resp)
 
 
@@ -646,6 +704,8 @@ def _startup() -> None:
     log.info("  Complex model: %s (%s)", cfg["models"]["complex"]["model"], cfg["models"]["complex"]["base_url"])
     if cfg["models"]["complex"].get("fallback_model"):
         log.info("  Fallback: %s (%s)", cfg["models"]["complex"]["fallback_model"], cfg["models"]["complex"]["fallback_base_url"])
+    if cfg["models"]["complex"].get("fallback2_model"):
+        log.info("  Fallback2: %s (%s)", cfg["models"]["complex"]["fallback2_model"], cfg["models"]["complex"]["fallback2_base_url"])
     app.state.config = cfg
 
 

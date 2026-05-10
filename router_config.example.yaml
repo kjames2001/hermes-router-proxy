@@ -36,9 +36,12 @@ models:
     base_url: https://YOUR_COMPLEX_PROVIDER/v1
     api_key_env: COMPLEX_API_KEY
     timeout_seconds: 300
-    fallback_model: YOUR_FALLBACK_MODEL
+    fallback_model: YOUR_SMART_FALLBACK_MODEL
     fallback_base_url: https://YOUR_FALLBACK_PROVIDER/v1
     fallback_key_env: FALLBACK_API_KEY
+    fallback2_model: YOUR_LAST_RESORT_MODEL     # optional: tried after fallback1 fails
+    fallback2_base_url: https://YOUR_LAST_RESORT/v1
+    fallback2_key_env: LAST_RESORT_API_KEY
 
 routing:
   escalation_keywords:                 # keywords that force → complex
