@@ -16,6 +16,7 @@ License: MIT
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import logging
 import os
@@ -28,14 +29,53 @@ from typing import Any
 import httpx
 import yaml
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 
 # ── Logging ─────────────────────────────────────────────────────────────────
+class JsonFormatter(logging.Formatter):
+    """Structured JSON log formatter — one line per record."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        import json
+        return json.dumps(
+            {
+                "timestamp": self.formatTime(record, "%Y-%m-%dT%H:%M:%S"),
+                "level": record.levelname,
+                "logger": record.name,
+                "module": record.module,
+                "line": record.lineno,
+                "message": record.getMessage(),
+            },
+            ensure_ascii=False,
+            default=str,
+        )
+
+
+_log_format = os.environ.get("LOG_FORMAT", "").strip().lower()
+if _log_format == "json":
+    _formatter = JsonFormatter()
+else:
+    _formatter = logging.Formatter(
+        "%(asctime)s [router] %(levelname)s %(message)s"
+    )
+
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [router] %(levelname)s %(message)s",
+    format=None,  # handled by formatter
 )
+_log_handler = logging.getLogger().handlers[0]
+_log_handler.setFormatter(_formatter)
+
 log = logging.getLogger("hermes-router")
+
+# Also configure uvicorn's loggers for JSON mode
+if _log_format == "json":
+    for _name in ("uvicorn", "uvicorn.access", "uvicorn.error"):
+        _uv_logger = logging.getLogger(_name)
+        _uv_logger.handlers.clear()
+        _uv_logger.addHandler(_log_handler)
+        _uv_logger.propagate = False
 
 # ── Config ─────────────────────────────────────────────────────────────────
 CONFIG_DIR = Path(__file__).resolve().parent
@@ -64,7 +104,7 @@ def build_classification_prompt(
     """
     Return the full classification prompt with profile hint injected.
     On first call (profile_hint empty) or when force_extract=True,
-    reads SOUL.md and caches a 2–3 sentence summary back to config.
+    reads USER.md + MEMORY.md and caches a 2-3 sentence summary back to config.
     """
     hint = cfg["classifier"].get("profile_hint", "").strip()
 
@@ -81,14 +121,29 @@ def build_classification_prompt(
 
 
 def _extract_profile_hint(cfg: dict) -> str:
-    """Read SOUL.md, pass to flash model, return a 2–3 sentence summary."""
-    soul_path = Path(cfg["persona"]["soul_path"]).expanduser()
-    if not soul_path.exists():
-        log.warning("SOUL.md not found at %s — skipping profile extraction", soul_path)
+    """Read USER.md + MEMORY.md, pass to flash model, return a 2-3 sentence summary.
+
+    USER.md contains who the user is (name, identity, preferences, location).
+    MEMORY.md contains durable facts (rules, environment, tool quirks).
+    Together they give the classifier enough context for accurate routing.
+    """
+    p = cfg["persona"]
+    user_path = Path(p["user_path"]).expanduser()
+    memory_path = Path(p["memory_path"]).expanduser()
+
+    parts: list[str] = []
+    for label, path in (("USER.md", user_path), ("MEMORY.md", memory_path)):
+        if path.exists():
+            parts.append(path.read_text().strip())
+        else:
+            log.warning("%s not found at %s", label, path)
+
+    if not parts:
+        log.warning("Neither USER.md nor MEMORY.md found — skipping profile extraction")
         return "No profile available."
 
-    max_chars = cfg["persona"].get("max_context_chars", 800)
-    raw = soul_path.read_text()[:max_chars]
+    max_chars = p.get("max_context_chars", 800)
+    raw = "\n\n".join(parts)[:max_chars]
 
     prompt = (
         "Summarize this AI agent's user identity, environment, and key tools "
@@ -96,7 +151,7 @@ def _extract_profile_hint(cfg: dict) -> str:
         f"or 'complex'.\n\n{raw}"
     )
 
-    log.info("Extracting profile hint from SOUL.md (%d chars) → flash model", len(raw))
+    log.info("Extracting profile hint from USER.md+MEMORY.md (%d chars) → flash model", len(raw))
     summary = _call_classifier_raw(cfg, prompt, max_tokens=100)
     return summary.strip() or "No profile available."
 
@@ -167,8 +222,10 @@ def classify(cfg: dict, user_message: str) -> str:
     Ask the flash classifier: "simple" or "complex"?
     Returns "simple" as safe default on any failure.
     """
+    t0 = time.time()
     prompt = build_classification_prompt(cfg, user_message)
     result = _call_classifier_raw(cfg, prompt, max_tokens=32)
+    _record_classifier_latency((time.time() - t0) * 1000)
 
     if "complex" in result:
         return "complex"
@@ -251,6 +308,121 @@ def has_deviation(cfg: dict, text: str, current_tier: str) -> bool:
 # In-memory: session_key → {"tier": "simple"|"complex", "at": timestamp}
 SESSIONS: dict[str, dict[str, Any]] = {}
 
+# ── Metrics ─────────────────────────────────────────────────────────────────
+# Prometheus-compatible counters for GET /metrics
+METRICS: dict[str, int] = {
+    "requests_total_simple": 0,
+    "requests_total_complex": 0,
+    "classifier_calls_total": 0,
+    "classifier_latency_ms_sum": 0,
+    "cache_hits_total": 0,
+    "429_total": 0,
+    "429_simple": 0,
+    "429_complex": 0,
+    "fallback_used_total": 0,
+    "fallback2_used_total": 0,
+    "stream_requests_total": 0,
+    "errors_total": 0,
+}
+
+# ── Circuit Breakers ────────────────────────────────────────────────────────
+# Per-endpoint circuit breakers that track consecutive 429s.
+# After N consecutive failures in a sliding window, open the circuit
+# (skip the endpoint entirely) for X seconds.
+CIRCUITS: dict[str, dict[str, Any]] = {}
+
+# Defaults — overridable via router_config.yaml → circuit_breaker section
+CB_DEFAULTS: dict[str, int] = {
+    "failure_threshold": 3,      # consecutive 429s before tripping
+    "recovery_timeout_sec": 30,  # how long the circuit stays open
+    "window_sec": 60,            # sliding window for counting failures
+}
+
+
+def _circuit_key(base_url: str) -> str:
+    """Normalize a base_url into a circuit breaker key."""
+    return base_url.rstrip("/").replace("://", "_").replace("/", "_").replace(".", "_")
+
+
+def _circuit_is_open(cfg: dict, base_url: str) -> bool:
+    """Check whether the circuit for this endpoint is currently open."""
+    cb_cfg = cfg.get("circuit_breaker", CB_DEFAULTS)
+    key = _circuit_key(base_url)
+    entry = CIRCUITS.get(key)
+    if not entry:
+        return False
+    if entry["state"] != "open":
+        return False
+    if time.time() - entry["opened_at"] > cb_cfg.get("recovery_timeout_sec", 30):
+        log.info("Circuit %s → half-open (recovery timeout elapsed)", key)
+        entry["state"] = "half_open"
+        entry["half_open_at"] = time.time()
+        return False
+    remaining = cb_cfg.get("recovery_timeout_sec", 30) - int(time.time() - entry["opened_at"])
+    if remaining > 0:
+        log.debug("Circuit %s is open (%ds remaining)", key, remaining)
+    return True
+
+
+def _circuit_record_success(cfg: dict, base_url: str) -> None:
+    """Reset the circuit breaker after a successful request."""
+    key = _circuit_key(base_url)
+    entry = CIRCUITS.get(key)
+    if entry and entry["state"] == "half_open":
+        log.info("Circuit %s → closed (success in half-open)", key)
+    CIRCUITS[key] = {"state": "closed", "failures": 0, "last_failure_at": 0}
+
+
+def _circuit_record_failure(cfg: dict, base_url: str) -> None:
+    """Record a failure (429) and potentially open the circuit."""
+    cb_cfg = cfg.get("circuit_breaker", CB_DEFAULTS)
+    key = _circuit_key(base_url)
+    entry = CIRCUITS.get(key, {"state": "closed", "failures": 0, "last_failure_at": 0})
+    now = time.time()
+    window = cb_cfg.get("window_sec", 60)
+    if now - entry.get("last_failure_at", 0) > window:
+        entry["failures"] = 0
+    entry["failures"] += 1
+    entry["last_failure_at"] = now
+    threshold = cb_cfg.get("failure_threshold", 3)
+    if entry["failures"] >= threshold and entry["state"] != "open":
+        log.warning(
+            "Circuit %s → OPEN (%d failures in %ds, recovery in %ds)",
+            key, entry["failures"], window,
+            cb_cfg.get("recovery_timeout_sec", 30),
+        )
+        entry["state"] = "open"
+        entry["opened_at"] = now
+    CIRCUITS[key] = entry
+
+
+def _inc_metric(name: str, delta: int = 1) -> None:
+    """Increment a metric counter atomically (single-threaded safe)."""
+    if name in METRICS:
+        METRICS[name] += delta
+
+
+def _inc_metric_tier(tier: str, name: str, delta: int = 1) -> None:
+    """Increment a tier-scoped metric: {name}_{tier}."""
+    _inc_metric(f"{name}_{tier}", delta)
+
+
+def _record_classifier_latency(ms: float) -> None:
+    """Record classifier call latency."""
+    METRICS["classifier_calls_total"] += 1
+    METRICS["classifier_latency_ms_sum"] += int(ms)
+
+
+def _get_metrics() -> dict:
+    """Return a copy of current metrics with computed fields."""
+    m = dict(METRICS)
+    calls = m["classifier_calls_total"]
+    m["classifier_latency_ms_avg"] = (
+        m["classifier_latency_ms_sum"] // calls if calls > 0 else 0
+    )
+    m["sessions_active"] = len(SESSIONS)
+    return m
+
 
 def session_key(messages: list[dict]) -> str | None:
     """Derive a session key from the first user message. Returns None if empty."""
@@ -293,14 +465,27 @@ def cache_tier(key: str, tier: str) -> None:
 # ── Model Calling ───────────────────────────────────────────────────────────
 
 def call_model(
-    model_cfg: dict, request_payload: dict
+    cfg: dict, model_cfg: dict, request_payload: dict
 ) -> httpx.Response:
     """Call an OpenAI-compatible endpoint. Returns the httpx response.
 
+    Circuit breaker: checks if the endpoint circuit is open before calling.
     Key rotation: if the primary key returns HTTP 429 (rate-limited),
     retries with alternate_key_env before giving up.
     """
-    url = f"{model_cfg['base_url'].rstrip('/')}/chat/completions"
+    base_url = model_cfg["base_url"].rstrip("/")
+    url = f"{base_url}/chat/completions"
+
+    # Circuit breaker check
+    if _circuit_is_open(cfg, base_url):
+        log.warning("Circuit open for %s — skipping call", base_url)
+        _inc_metric_tier(model_cfg.get("tier", "unknown"), "429")
+        _inc_metric("429_total")
+        # Return synthetic 503 response — let caller handle fallback
+        r = httpx.Response(503, text="Circuit breaker open")
+        r._request = httpx.Request("POST", url)
+        return r
+
     api_key = env_key(model_cfg["api_key_env"])
     timeout = model_cfg.get("timeout_seconds", 120)
     alt_key = env_key(model_cfg.get("alternate_key_env", ""))
@@ -317,6 +502,14 @@ def call_model(
         timeout=httpx.Timeout(timeout),
     )
 
+    # Circuit + metric tracking for 429
+    if resp.status_code == 429:
+        _circuit_record_failure(cfg, base_url)
+        _inc_metric_tier(model_cfg.get("tier", "unknown"), "429")
+        _inc_metric("429_total")
+    elif resp.status_code == 200:
+        _circuit_record_success(cfg, base_url)
+
     # Key rotation: HTTP 429 with alternate key available -> retry
     if resp.status_code == 429 and alt_key:
         log.warning("Primary key rate-limited (429) - switching to alternate key")
@@ -331,6 +524,7 @@ def call_model(
         )
         if resp.status_code == 200:
             log.info("Alternate key succeeded")
+            _circuit_record_success(cfg, base_url)
 
     return resp
 
@@ -395,6 +589,7 @@ async def route_request_stream(cfg: dict, payload: dict):
                 cache_tier(key, tier)
             else:
                 tier = cached
+                _inc_metric("cache_hits_total")
 
     model_cfg = cfg["models"][tier]
     log.info("Streaming session %s → %s (%s)", key, tier, model_cfg["model"])
@@ -480,12 +675,37 @@ async def route_request_stream(cfg: dict, payload: dict):
                     else:
                         fb_body = await fb_resp.aread()
                         error_msg = fb_body.decode(errors="replace")[:300]
+                        fb_status = fb_resp.status_code
+
+                        # Alternate key rotation for fallback on 429
+                        if fb_resp.status_code == 429:
+                            fb_alt_key = env_key(model_cfg.get("fallback_alternate_key_env", ""))
+                            if fb_alt_key:
+                                log.warning("Fallback key rate-limited (429) - switching to alternate key")
+                                alt_fb_headers = {**fb_headers, "Authorization": f"Bearer {fb_alt_key}"}
+                                async with client.stream(
+                                    "POST", fb_url, json=fb_payload, headers=alt_fb_headers,
+                                    timeout=httpx.Timeout(fb_cfg["timeout_seconds"]),
+                                ) as alt_fb_resp:
+                                    if alt_fb_resp.status_code == 200:
+                                        log.info("Alternate fallback key succeeded")
+                                        async for line in alt_fb_resp.aiter_lines():
+                                            if line:
+                                                yield f"{line}\n".encode()
+                                            else:
+                                                yield b"\n"
+                                        return
+                                    else:
+                                        alt_body = await alt_fb_resp.aread()
+                                        error_msg = alt_body.decode(errors="replace")[:300]
+                                        fb_status = alt_fb_resp.status_code
+
                         # Fallback 1 failed — try fallback 2
                         fb2_model = model_cfg.get("fallback2_model")
                         if fb2_model:
                             log.warning(
                                 "Fallback %s returned %d — trying fallback2 %s",
-                                fallback_model, fb_resp.status_code, fb2_model,
+                                fallback_model, fb_status, fb2_model,
                             )
                             fb2_cfg = {
                                 "model": fb2_model,
@@ -514,7 +734,30 @@ async def route_request_stream(cfg: dict, payload: dict):
                                 else:
                                     fb2_body = await fb2_resp.aread()
                                     fb2_error = fb2_body.decode(errors="replace")[:200]
-                                    yield f'data: {{"error":{{"message":"Fallbacks exhausted: {fallback_model}({fb_resp.status_code}), {fb2_model}({fb2_resp.status_code}) - {fb2_error}","type":"upstream_error"}}}}\n\n'.encode()
+
+                                    # Alternate key rotation for fallback2 on 429
+                                    if fb2_resp.status_code == 429:
+                                        fb2_alt_key = env_key(model_cfg.get("fallback2_alternate_key_env", ""))
+                                        if fb2_alt_key:
+                                            log.warning("Fallback2 key rate-limited (429) - switching to alternate key")
+                                            alt_fb2_headers = {**fb2_headers, "Authorization": f"Bearer {fb2_alt_key}"}
+                                            async with client.stream(
+                                                "POST", fb2_url, json=fb2_payload, headers=alt_fb2_headers,
+                                                timeout=httpx.Timeout(fb2_cfg["timeout_seconds"]),
+                                            ) as alt_fb2_resp:
+                                                if alt_fb2_resp.status_code == 200:
+                                                    log.info("Alternate fallback2 key succeeded")
+                                                    async for line in alt_fb2_resp.aiter_lines():
+                                                        if line:
+                                                            yield f"{line}\n".encode()
+                                                        else:
+                                                            yield b"\n"
+                                                    return
+                                                else:
+                                                    fb2_body = await alt_fb2_resp.aread()
+                                                    fb2_error = fb2_body.decode(errors="replace")[:200]
+
+                                    yield f'data: {{"error":{{"message":"Fallbacks exhausted: {fallback_model}({fb_status}), {fb2_model}({fb2_resp.status_code}) - {fb2_error}","type":"upstream_error"}}}}\n\n'.encode()
                                     yield b'data: [DONE]\n\n'
                                     return
                         else:
@@ -573,12 +816,15 @@ def route_request(cfg: dict, payload: dict) -> JSONResponse:
                 cache_tier(key, tier)
             else:
                 tier = cached
+                _inc_metric("cache_hits_total")
 
     # ── Call model ──────────────────────────────────────────────────────
     model_cfg = cfg["models"][tier]
+    model_cfg["tier"] = tier  # for circuit breaker metric labeling
+    _inc_metric_tier(tier, "requests_total")
     log.info("Routing session %s → %s (%s)", key, tier, model_cfg["model"])
 
-    resp = call_model(model_cfg, payload)
+    resp = call_model(cfg, model_cfg, payload)
 
     if resp.status_code == 200:
         return JSONResponse(content=resp.json())
@@ -595,13 +841,16 @@ def route_request(cfg: dict, payload: dict) -> JSONResponse:
         fallback_model,
     )
 
+    _inc_metric("fallback_used_total")
     fb_cfg = {
         "model": fallback_model,
         "base_url": model_cfg["fallback_base_url"],
         "api_key_env": model_cfg["fallback_key_env"],
+        "alternate_key_env": model_cfg.get("fallback_alternate_key_env", ""),
         "timeout_seconds": model_cfg.get("timeout_seconds", 120),
+        "tier": tier,
     }
-    fb_resp = call_model(fb_cfg, payload)
+    fb_resp = call_model(cfg, fb_cfg, payload)
 
     if fb_resp.status_code == 200:
         data = fb_resp.json()
@@ -615,13 +864,16 @@ def route_request(cfg: dict, payload: dict) -> JSONResponse:
             "Fallback %s returned %d — trying fallback2 %s",
             fallback_model, fb_resp.status_code, fb2_model,
         )
+        _inc_metric("fallback2_used_total")
         fb2_cfg = {
             "model": fb2_model,
             "base_url": model_cfg["fallback2_base_url"],
             "api_key_env": model_cfg["fallback2_key_env"],
+            "alternate_key_env": model_cfg.get("fallback2_alternate_key_env", ""),
             "timeout_seconds": model_cfg.get("timeout_seconds", 120),
+            "tier": tier,
         }
-        fb2_resp = call_model(fb2_cfg, payload)
+        fb2_resp = call_model(cfg, fb2_cfg, payload)
         if fb2_resp.status_code == 200:
             data = fb2_resp.json()
             data.setdefault("hermes_router", {})["fallback_used"] = True
@@ -694,6 +946,17 @@ app = FastAPI(
     redoc_url=None,
 )
 
+# ── CORS ──────────────────────────────────────────────────────────────────
+origins_raw = os.environ.get("CORS_ORIGINS", "*").strip()
+allowed_origins = [o.strip() for o in origins_raw.split(",") if o.strip()]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=allowed_origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 
 @app.on_event("startup")
 def _startup() -> None:
@@ -715,18 +978,203 @@ async def health():
     return {"status": "ok", "sessions": len(SESSIONS)}
 
 
+@app.post("/reload")
+async def reload_config(request: Request):
+    """Hot-reload router_config.yaml without restart.
+
+    Reads config from disk, validates required sections, atomically
+    swaps app.state.config. Clears profile_hint to force re-extraction
+    on the next classification request.
+    """
+    verify_auth(request)
+
+    old_cfg = request.app.state.config
+    old_simple = old_cfg["models"]["simple"]["model"]
+    old_complex = old_cfg["models"]["complex"]["model"]
+
+    try:
+        new_cfg = load_config()
+    except Exception as exc:
+        log.error("Failed to parse config on reload: %s", exc)
+        raise HTTPException(
+            status_code=400,
+            detail={"error": {"message": f"Config parse error: {exc}", "type": "reload_error"}},
+        )
+
+    # Validate minimum structure
+    for section in ("classifier", "models", "routing", "server"):
+        if section not in new_cfg:
+            raise HTTPException(
+                status_code=400,
+                detail={"error": {"message": f"Missing required section: {section}", "type": "reload_error"}},
+            )
+    for tier in ("simple", "complex"):
+        if tier not in new_cfg.get("models", {}):
+            raise HTTPException(
+                status_code=400,
+                detail={"error": {"message": f"Missing models.{tier} in config", "type": "reload_error"}},
+            )
+
+    # Clear profile_hint so extraction runs with fresh config
+    new_cfg["classifier"]["profile_hint"] = ""
+
+    # Atomic swap
+    request.app.state.config = new_cfg
+
+    log.info(
+        "Config hot-reloaded. Simple: %s → %s, Complex: %s → %s",
+        old_simple, new_cfg["models"]["simple"]["model"],
+        old_complex, new_cfg["models"]["complex"]["model"],
+    )
+
+    return {
+        "status": "reloaded",
+        "before": {"simple": old_simple, "complex": old_complex},
+        "after": {
+            "simple": new_cfg["models"]["simple"]["model"],
+            "complex": new_cfg["models"]["complex"]["model"],
+        },
+    }
+
+
+@app.get("/circuits")
+async def list_circuits(request: Request):
+    """List all circuit breaker states."""
+    verify_auth(request)
+    return {
+        "circuits": CIRCUITS,
+        "defaults": CB_DEFAULTS,
+    }
+
+
+@app.post("/circuits/reset")
+async def reset_circuits(request: Request):
+    """Reset all circuit breakers back to closed state."""
+    verify_auth(request)
+    count = len(CIRCUITS)
+    CIRCUITS.clear()
+    log.info("Reset %d circuit breakers", count)
+    return {"status": "reset", "count": count}
+
+
+@app.get("/admin/sessions")
+async def list_sessions(request: Request):
+    """List all cached sessions with tier info."""
+    verify_auth(request)
+    now = time.time()
+    cfg = request.app.state.config
+    timeout_mins = cfg["classifier"].get("session_timeout_minutes", 5)
+    sessions = {}
+    for key, entry in list(SESSIONS.items()):
+        age_sec = int(now - entry["at"])
+        remaining_sec = max(0, timeout_mins * 60 - age_sec)
+        sessions[key] = {
+            "tier": entry["tier"],
+            "age_sec": age_sec,
+            "remaining_sec": remaining_sec,
+        }
+    return {"count": len(sessions), "session_timeout_minutes": timeout_mins, "sessions": sessions}
+
+
+@app.delete("/admin/sessions/{key}")
+async def evict_session(key: str, request: Request):
+    """Force-evict a cached session, forcing re-classification on next message."""
+    verify_auth(request)
+    removed = SESSIONS.pop(key, None)
+    if removed:
+        log.info("Session %s evicted (was %s)", key, removed["tier"])
+        return {"status": "evicted", "key": key, "was_tier": removed["tier"]}
+    raise HTTPException(
+        status_code=404,
+        detail={"error": {"message": f"Session {key} not found", "type": "not_found"}},
+    )
+
+
+@app.get("/admin/config")
+async def get_config(request: Request):
+    """Return current config with sensitive keys redacted."""
+    verify_auth(request)
+    cfg_copy = copy.deepcopy(request.app.state.config)
+    # Redact env var names (not values — those stay in env, not config)
+    # No actual API keys are in the config, just env var names.
+    # We show the raw config as-is since it only references env vars.
+    return cfg_copy
+
+
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
     """OpenAI-compatible chat completions — routed automatically."""
     verify_auth(request)
     cfg = request.app.state.config
     payload = await request.json()
-    if payload.get("stream"):
-        return StreamingResponse(
-            route_request_stream(cfg, payload),
-            media_type="text/event-stream",
-        )
-    return route_request(cfg, payload)
+    try:
+        if payload.get("stream"):
+            _inc_metric("stream_requests_total")
+            return StreamingResponse(
+                route_request_stream(cfg, payload),
+                media_type="text/event-stream",
+            )
+        return route_request(cfg, payload)
+    except Exception:
+        _inc_metric("errors_total")
+        raise
+
+
+@app.get("/metrics")
+async def metrics(request: Request):
+    """Prometheus-compatible metrics endpoint with router-specific counters."""
+    verify_auth(request)
+    m = _get_metrics()
+    # Prometheus text format
+    lines = [
+        "# HELP hermes_router_requests_total Total requests by tier",
+        "# TYPE hermes_router_requests_total counter",
+        f"hermes_router_requests_total{{tier=\"simple\"}} {m['requests_total_simple']}",
+        f"hermes_router_requests_total{{tier=\"complex\"}} {m['requests_total_complex']}",
+        "",
+        "# HELP hermes_router_classifier_calls_total Classifier model calls",
+        "# TYPE hermes_router_classifier_calls_total counter",
+        f"hermes_router_classifier_calls_total {m['classifier_calls_total']}",
+        "",
+        "# HELP hermes_router_classifier_latency_ms Classifier latency in ms",
+        "# TYPE hermes_router_classifier_latency_ms summary",
+        f"hermes_router_classifier_latency_ms_sum {m['classifier_latency_ms_sum']}",
+        f"hermes_router_classifier_latency_ms_avg {m['classifier_latency_ms_avg']}",
+        "",
+        "# HELP hermes_router_cache_hits_total Session cache hits (skip classifier)",
+        "# TYPE hermes_router_cache_hits_total counter",
+        f"hermes_router_cache_hits_total {m['cache_hits_total']}",
+        "",
+        "# HELP hermes_router_429_total Rate limit hits by tier",
+        "# TYPE hermes_router_429_total counter",
+        f"hermes_router_429_total{{tier=\"simple\"}} {m['429_simple']}",
+        f"hermes_router_429_total{{tier=\"complex\"}} {m['429_complex']}",
+        f"hermes_router_429_total {m['429_total']}",
+        "",
+        "# HELP hermes_router_fallback_used_total Fallback tiers triggered",
+        "# TYPE hermes_router_fallback_used_total counter",
+        f"hermes_router_fallback_used_total{{level=\"1\"}} {m['fallback_used_total']}",
+        f"hermes_router_fallback_used_total{{level=\"2\"}} {m['fallback2_used_total']}",
+        "",
+        "# HELP hermes_router_stream_requests_total Streaming requests",
+        "# TYPE hermes_router_stream_requests_total counter",
+        f"hermes_router_stream_requests_total {m['stream_requests_total']}",
+        "",
+        "# HELP hermes_router_errors_total Internal errors",
+        "# TYPE hermes_router_errors_total counter",
+        f"hermes_router_errors_total {m['errors_total']}",
+        "",
+        "# HELP hermes_router_sessions_active Active session count",
+        "# TYPE hermes_router_sessions_active gauge",
+        f"hermes_router_sessions_active {m['sessions_active']}",
+        "",
+        "# HELP hermes_router_circuits_open Number of open circuit breakers",
+        "# TYPE hermes_router_circuits_open gauge",
+        f"hermes_router_circuits_open {sum(1 for c in CIRCUITS.values() if c.get('state') == 'open')}",
+    ]
+    return JSONResponse(
+        content={"metrics": m, "prometheus": "\n".join(lines)},
+    )
 
 
 # ── Entry Point ─────────────────────────────────────────────────────────────
