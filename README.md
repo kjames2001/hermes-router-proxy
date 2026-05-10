@@ -190,6 +190,33 @@ Then restart the Hermes gateway.
 
 The `/v1/chat/completions` endpoint accepts the standard OpenAI chat completions request body (`model`, `messages`, `temperature`, `stream`, etc.). The `model` field is overwritten by the router based on classification.
 
+### Authentication
+
+By default, the router-proxy is **open** (no auth). To enable API key authentication:
+
+1. Set environment variable:
+   ```bash
+   echo 'ROUTER_PROXY_API_KEY=your-secret-key-here' >> ~/.hermes/.env
+   ```
+   Generate a key with: `python3 -c "import secrets; print(secrets.token_urlsafe(32))"`
+
+2. In `router_config.yaml`, uncomment or add:
+   ```yaml
+   auth:
+     api_key_env: ROUTER_PROXY_API_KEY
+   ```
+
+3. Restart the service:
+   ```bash
+   systemctl --user restart hermes-router
+   ```
+
+Clients must send the key as a Bearer token in the `Authorization` header:
+```
+Authorization: Bearer your-secret-key-here
+```
+If the env var is unset or empty, auth is **skipped** (open mode). The `/health` endpoint always remains open.
+
 ---
 
 ## Classifier Performance
