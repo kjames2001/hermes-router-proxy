@@ -1,0 +1,19 @@
+version: "3.9"
+
+services:
+  router-proxy:
+    build: .
+    container_name: hermes-router
+    restart: unless-stopped
+    ports:
+      - "8766:8766"
+    env_file:
+      - /root/.hermes/.env          # Shared env with API keys
+    volumes:
+      - ./router_config.yaml:/app/router_config.yaml:ro   # Mount your real config
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import httpx; httpx.get('http://localhost:8766/health', timeout=5).raise_for_status() || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s

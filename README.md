@@ -181,6 +181,50 @@ Then restart the Hermes gateway.
 
 ---
 
+## Docker Deployment
+
+The router-proxy can run as a Docker container on any host with Docker Engine.
+
+### Build & Run
+
+```bash
+# Build the image
+docker build -t hermes-router:latest .
+
+# Run (mount your config + env)
+docker run -d --name hermes-router --restart unless-stopped \
+  -p 8766:8766 \
+  -v /path/to/router_config.yaml:/app/router_config.yaml:ro \
+  --env-file /root/.hermes/.env \
+  hermes-router:latest
+```
+
+### Docker Compose
+
+```yaml
+# docker-compose.yaml
+services:
+  router-proxy:
+    image: hermes-router:latest
+    build: .
+    container_name: hermes-router
+    restart: unless-stopped
+    ports:
+      - "8766:8766"
+    env_file:
+      - /root/.hermes/.env
+    volumes:
+      - ./router_config.yaml:/app/router_config.yaml:ro
+```
+
+```bash
+docker compose up -d
+```
+
+> **Note:** The default image comes with `router_config.example.yaml` as the config. Mount your real `router_config.yaml` to override. The env file needs the API keys (`OPENCODE_GO_API_KEY`, `OLLAMA_API_KEY`, etc.) and optionally `ROUTER_PROXY_API_KEY` for auth.
+
+---
+
 ## API Endpoints
 
 | Endpoint | Method | Description |
@@ -208,7 +252,11 @@ By default, the router-proxy is **open** (no auth). To enable API key authentica
 
 3. Restart the service:
    ```bash
+   # systemd (native deployment)
    systemctl --user restart hermes-router
+
+   # Docker
+   docker restart hermes-router
    ```
 
 Clients must send the key as a Bearer token in the `Authorization` header:
