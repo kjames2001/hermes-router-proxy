@@ -256,6 +256,9 @@ routing:
     - is it up
     - uptime
 
+auth:
+  api_key_env: ROUTER_PROXY_API_KEY     # env var name for auth key; unset = no auth (open)
+
 server:
   port: 8766
   host: 0.0.0.0
