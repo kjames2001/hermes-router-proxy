@@ -27,7 +27,7 @@ from typing import Any
 
 import httpx
 import yaml
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 # ── Logging ─────────────────────────────────────────────────────────────────
@@ -612,6 +612,23 @@ def _proxy_error(resp: httpx.Response) -> JSONResponse:
 
 # ── FastAPI Application ─────────────────────────────────────────────────────
 
+def verify_auth(request: Request):
+    """Check Bearer token against configured API key."""
+    cfg = request.app.state.config
+    key_env = cfg.get("auth", {}).get("api_key_env", "")
+    if not key_env:
+        return  # No auth configured — allow all
+    expected = os.environ.get(key_env, "").strip()
+    if not expected:
+        return  # Env var not set — allow all
+    auth_header = request.headers.get("Authorization", "")
+    if auth_header.startswith("Bearer ") and auth_header[7:] == expected:
+        return
+    raise HTTPException(
+        status_code=401,
+        detail={"error": {"message": "Invalid or missing API key", "type": "auth_error"}},
+    )
+
 app = FastAPI(
     title="Hermes Model Router",
     version="1.0.0",
@@ -641,7 +658,8 @@ async def health():
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
     """OpenAI-compatible chat completions — routed automatically."""
-    cfg = app.state.config
+    verify_auth(request)
+    cfg = request.app.state.config
     payload = await request.json()
     if payload.get("stream"):
         return StreamingResponse(
