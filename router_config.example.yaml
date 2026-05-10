@@ -28,6 +28,9 @@ models:
     base_url: https://YOUR_SIMPLE_PROVIDER/v1
     api_key_env: SIMPLE_API_KEY
     timeout_seconds: 120
+    fallback_model: YOUR_FALLBACK_MODEL        # optional: fallback when simple is 429
+    fallback_base_url: https://YOUR_FALLBACK/v1
+    fallback_key_env: FALLBACK_API_KEY
   complex:
     model: YOUR_SMART_MODEL            # e.g. deepseek-v4-pro, claude-sonnet-4
     base_url: https://YOUR_COMPLEX_PROVIDER/v1
