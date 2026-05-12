@@ -463,6 +463,42 @@ def cache_tier(key: str, tier: str) -> None:
 
 
 # ── Model Calling ───────────────────────────────────────────────────────────
+_RETRYABLE_EXC = (httpx.RemoteProtocolError, httpx.ConnectError, httpx.ReadTimeout, httpx.ConnectTimeout)
+_RETRY_MAX = 2  # total attempts = 1 + _RETRY_MAX = 3
+
+
+def _post_with_retry(
+    url: str,
+    *,
+    json: dict,
+    headers: dict,
+    timeout: httpx.Timeout,
+    label: str = "",
+) -> httpx.Response:
+    """httpx POST with built-in retry for transient transport errors.
+
+    RemoteProtocolError / ConnectError / ReadTimeout / ConnectTimeout are
+    retried up to _RETRY_MAX times with 1-second backoff.  Non-transient
+    errors (4xx, 5xx) are returned as-is so the caller can handle fallback.
+    """
+    last_exc: Exception | None = None
+    for attempt in range(_RETRY_MAX + 1):
+        try:
+            return httpx.post(url, json=json, headers=headers, timeout=timeout)
+        except _RETRYABLE_EXC as exc:
+            last_exc = exc
+            if attempt < _RETRY_MAX:
+                delay = 1.0 * (attempt + 1)
+                log.warning(
+                    "%s transient error (attempt %s/%s): %s — retrying in %.1fs",
+                    label, attempt + 1, _RETRY_MAX + 1, exc, delay,
+                )
+                time.sleep(delay)
+            else:
+                log.error(
+                    "%s exhausted %s retries: %s", label, _RETRY_MAX + 1, exc
+                )
+    raise last_exc  # type: ignore[misc]
 
 def call_model(
     cfg: dict, model_cfg: dict, request_payload: dict
@@ -472,6 +508,8 @@ def call_model(
     Circuit breaker: checks if the endpoint circuit is open before calling.
     Key rotation: if the primary key returns HTTP 429 (rate-limited),
     retries with alternate_key_env before giving up.
+    503 retry: HTTP 503 (overloaded) retries up to 3x with exponential backoff
+    (2s, 4s, 8s) so transient overloads are resolved before escalation.
     """
     base_url = model_cfg["base_url"].rstrip("/")
     url = f"{base_url}/chat/completions"
@@ -481,7 +519,6 @@ def call_model(
         log.warning("Circuit open for %s — skipping call", base_url)
         _inc_metric_tier(model_cfg.get("tier", "unknown"), "429")
         _inc_metric("429_total")
-        # Return synthetic 503 response — let caller handle fallback
         r = httpx.Response(503, text="Circuit breaker open")
         r._request = httpx.Request("POST", url)
         return r
@@ -495,33 +532,59 @@ def call_model(
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
 
-    resp = httpx.post(
-        url,
-        json=payload,
-        headers=headers,
-        timeout=httpx.Timeout(timeout),
-    )
+    # ── 503 retry: exponential backoff (2s, 4s, 8s) ──────────────────────────
+    _503_retries = 3
+    _503_backoff = [2.0, 4.0, 8.0]
+    for attempt_503 in range(_503_retries):
+        try:
+            resp = httpx.post(url, json=payload, headers=headers, timeout=httpx.Timeout(timeout))
+        except Exception as exc:
+            log.warning("Transport error for %s: %s", model_cfg["model"], exc)
+            # Let caller handle fallback — don't retry transport-level here
+            r = httpx.Response(503, text=str(exc))
+            r._request = httpx.Request("POST", url)
+            return r
 
-    # Circuit + metric tracking for 429
+        if resp.status_code != 503:
+            break
+
+        if attempt_503 < _503_retries - 1:
+            delay = _503_backoff[attempt_503]
+            err_brief = resp.text[:150] if resp.text else ""
+            log.warning(
+                "HTTP 503 for %s (attempt %s/%s) — backing off %.1fs: %s",
+                model_cfg["model"], attempt_503 + 1, _503_retries, delay, err_brief,
+            )
+            time.sleep(delay)
+        else:
+            err_brief = resp.text[:150] if resp.text else ""
+            log.error(
+                "HTTP 503 exhausted %s retries for %s: %s",
+                _503_retries, model_cfg["model"], err_brief,
+            )
+
+    # Circuit + metric tracking
     if resp.status_code == 429:
         _circuit_record_failure(cfg, base_url)
         _inc_metric_tier(model_cfg.get("tier", "unknown"), "429")
         _inc_metric("429_total")
+    elif resp.status_code in (502, 503, 504):
+        _circuit_record_failure(cfg, base_url)
     elif resp.status_code == 200:
         _circuit_record_success(cfg, base_url)
 
     # Key rotation: HTTP 429 with alternate key available -> retry
     if resp.status_code == 429 and alt_key:
         log.warning("Primary key rate-limited (429) - switching to alternate key")
-        resp = httpx.post(
-            url,
-            json=payload,
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {alt_key}",
-            },
-            timeout=httpx.Timeout(timeout),
-        )
+        try:
+            resp = httpx.post(
+                url,
+                json=payload,
+                headers={"Content-Type": "application/json", "Authorization": f"Bearer {alt_key}"},
+                timeout=httpx.Timeout(timeout),
+            )
+        except Exception:
+            pass
         if resp.status_code == 200:
             log.info("Alternate key succeeded")
             _circuit_record_success(cfg, base_url)
@@ -561,8 +624,34 @@ async def call_model_stream(model_cfg: dict, request_payload: dict):
         yield b''  # sentinel - metadata handled by wrapper
 
 
+# ── Retry-tracking: count consecutive primary failures per session.
+# Only after N failures does the next gateway retry skip to fallback.
+_RETRY_STATE: dict[str, int] = {}  # session_key → consecutive failure count
+_RETRY_MAX_BEFORE_FALLBACK = 3
+
+def _record_failure(key: str) -> int:
+    """Increment failure counter, return new count."""
+    cnt = _RETRY_STATE.get(key, 0) + 1
+    _RETRY_STATE[key] = cnt
+    return cnt
+
+def _clear_retry(key: str) -> None:
+    _RETRY_STATE.pop(key, None)
+
+def _should_use_fallback(key: str) -> bool:
+    return _RETRY_STATE.get(key, 0) >= _RETRY_MAX_BEFORE_FALLBACK
+
+
 async def route_request_stream(cfg: dict, payload: dict):
-    """Streaming version of route_request — returns SSE chunks from upstream."""
+    """Streaming version of route_request — returns SSE chunks from upstream.
+
+    Acts as a transparent proxy: opens an inner stream to the selected
+    upstream model and forwards every SSE chunk to the outer connection.
+    If the inner stream breaks mid-flight, the outer SSE is cleanly closed
+    so the gateway's own HERMES_STREAM_RETRIES can retry with a fresh
+    connection.  On that retry the primary is skipped and fallback is used
+    directly.
+    """
     messages = payload.get("messages", [])
     key = session_key(messages)
     if not key:
@@ -594,181 +683,55 @@ async def route_request_stream(cfg: dict, payload: dict):
     model_cfg = cfg["models"][tier]
     log.info("Streaming session %s → %s (%s)", key, tier, model_cfg["model"])
 
-    # Try primary first
+    # ── Retry check: after N consecutive failures, use fallback ────────
+    fallback_model = model_cfg.get("fallback_model")
+    if _should_use_fallback(key) and fallback_model:
+        log.info("Session %s has %s consecutive failures — using fallback %s",
+                 key, _RETRY_STATE[key], fallback_model)
+        model_cfg = dict(model_cfg)  # don't mutate original
+        model_cfg["model"] = fallback_model
+        model_cfg["base_url"] = model_cfg["fallback_base_url"]
+        model_cfg["api_key_env"] = model_cfg.get("fallback_key_env", model_cfg["api_key_env"])
+        model_cfg["alternate_key_env"] = model_cfg.get("fallback_alternate_key_env", "")
+
+    # ── Open inner stream, forward everything, no internal retries ────
     async with httpx.AsyncClient() as client:
         url = f"{model_cfg['base_url'].rstrip('/')}/chat/completions"
         api_key = env_key(model_cfg["api_key_env"])
         timeout = model_cfg.get("timeout_seconds", 120)
-        alt_key = env_key(model_cfg.get("alternate_key_env", ""))
-
         stream_payload = {**payload, "model": model_cfg["model"]}
         headers: dict[str, str] = {"Content-Type": "application/json"}
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
 
-        async with client.stream(
-            "POST", url, json=stream_payload, headers=headers,
-            timeout=httpx.Timeout(timeout),
-        ) as resp:
-            if resp.status_code == 200:
-                # Primary succeeded — forward SSE stream
-                log.info("Streaming primary %s OK", model_cfg["model"])
+        try:
+            async with client.stream(
+                "POST", url, json=stream_payload, headers=headers,
+                timeout=httpx.Timeout(timeout),
+            ) as resp:
+                if resp.status_code != 200:
+                    err_body = await resp.aread()
+                    err_text = err_body.decode(errors="replace")[:300]
+                    log.warning("Streaming upstream returned %d: %s", resp.status_code, err_text[:150])
+                    yield f'data: {{"error":{{"message":"Upstream {resp.status_code}: {err_text}","type":"upstream_error"}}}}\n\n'.encode()
+                    yield b'data: [DONE]\n\n'
+                    return
+
+                log.info("Streaming %s OK", model_cfg["model"])
                 async for line in resp.aiter_lines():
                     if line:
                         yield f"{line}\n".encode()
                     else:
                         yield b"\n"
-                return
+                # Success — clear the failure counter
+                _clear_retry(key)
+                return  # clean completion
 
-            # Primary failed — try alternate key if 429
-            if resp.status_code == 429 and alt_key:
-                log.warning("Primary key rate-limited (429) - switching to alternate key")
-                alt_headers = {
-                    "Content-Type": "application/json",
-                    "Authorization": f"Bearer {alt_key}",
-                }
-                async with client.stream(
-                    "POST", url, json=stream_payload, headers=alt_headers,
-                    timeout=httpx.Timeout(timeout),
-                ) as resp2:
-                    if resp2.status_code == 200:
-                        log.info("Alternate key succeeded")
-                        async for line in resp2.aiter_lines():
-                            if line:
-                                yield f"{line}\n".encode()
-                            else:
-                                yield b"\n"
-                        return
-
-            # Primary + alt key failed — try fallback
-            fallback_model = model_cfg.get("fallback_model")
-            if fallback_model:
-                log.warning(
-                    "Primary %s returned %d — streaming fallback to %s",
-                    model_cfg["model"], resp.status_code, fallback_model,
-                )
-                fb_cfg = {
-                    "model": fallback_model,
-                    "base_url": model_cfg["fallback_base_url"],
-                    "api_key_env": model_cfg["fallback_key_env"],
-                    "timeout_seconds": model_cfg.get("timeout_seconds", 120),
-                }
-                fb_url = f"{fb_cfg['base_url'].rstrip('/')}/chat/completions"
-                fb_key = env_key(fb_cfg["api_key_env"])
-                fb_headers: dict[str, str] = {"Content-Type": "application/json"}
-                if fb_key:
-                    fb_headers["Authorization"] = f"Bearer {fb_key}"
-                fb_payload = {**payload, "model": fb_cfg["model"]}
-
-                async with client.stream(
-                    "POST", fb_url, json=fb_payload, headers=fb_headers,
-                    timeout=httpx.Timeout(fb_cfg["timeout_seconds"]),
-                ) as fb_resp:
-                    if fb_resp.status_code == 200:
-                        log.info("Streaming fallback %s OK", fallback_model)
-                        async for line in fb_resp.aiter_lines():
-                            if line:
-                                yield f"{line}\n".encode()
-                            else:
-                                yield b"\n"
-                        return
-                    else:
-                        fb_body = await fb_resp.aread()
-                        error_msg = fb_body.decode(errors="replace")[:300]
-                        fb_status = fb_resp.status_code
-
-                        # Alternate key rotation for fallback on 429
-                        if fb_resp.status_code == 429:
-                            fb_alt_key = env_key(model_cfg.get("fallback_alternate_key_env", ""))
-                            if fb_alt_key:
-                                log.warning("Fallback key rate-limited (429) - switching to alternate key")
-                                alt_fb_headers = {**fb_headers, "Authorization": f"Bearer {fb_alt_key}"}
-                                async with client.stream(
-                                    "POST", fb_url, json=fb_payload, headers=alt_fb_headers,
-                                    timeout=httpx.Timeout(fb_cfg["timeout_seconds"]),
-                                ) as alt_fb_resp:
-                                    if alt_fb_resp.status_code == 200:
-                                        log.info("Alternate fallback key succeeded")
-                                        async for line in alt_fb_resp.aiter_lines():
-                                            if line:
-                                                yield f"{line}\n".encode()
-                                            else:
-                                                yield b"\n"
-                                        return
-                                    else:
-                                        alt_body = await alt_fb_resp.aread()
-                                        error_msg = alt_body.decode(errors="replace")[:300]
-                                        fb_status = alt_fb_resp.status_code
-
-                        # Fallback 1 failed — try fallback 2
-                        fb2_model = model_cfg.get("fallback2_model")
-                        if fb2_model:
-                            log.warning(
-                                "Fallback %s returned %d — trying fallback2 %s",
-                                fallback_model, fb_status, fb2_model,
-                            )
-                            fb2_cfg = {
-                                "model": fb2_model,
-                                "base_url": model_cfg["fallback2_base_url"],
-                                "api_key_env": model_cfg["fallback2_key_env"],
-                                "timeout_seconds": model_cfg.get("timeout_seconds", 120),
-                            }
-                            fb2_url = f"{fb2_cfg['base_url'].rstrip('/')}/chat/completions"
-                            fb2_key = env_key(fb2_cfg["api_key_env"])
-                            fb2_headers: dict[str, str] = {"Content-Type": "application/json"}
-                            if fb2_key:
-                                fb2_headers["Authorization"] = f"Bearer {fb2_key}"
-                            fb2_payload = {**payload, "model": fb2_cfg["model"]}
-                            async with client.stream(
-                                "POST", fb2_url, json=fb2_payload, headers=fb2_headers,
-                                timeout=httpx.Timeout(fb2_cfg["timeout_seconds"]),
-                            ) as fb2_resp:
-                                if fb2_resp.status_code == 200:
-                                    log.info("Streaming fallback2 %s OK", fb2_model)
-                                    async for line in fb2_resp.aiter_lines():
-                                        if line:
-                                            yield f"{line}\n".encode()
-                                        else:
-                                            yield b"\n"
-                                    return
-                                else:
-                                    fb2_body = await fb2_resp.aread()
-                                    fb2_error = fb2_body.decode(errors="replace")[:200]
-
-                                    # Alternate key rotation for fallback2 on 429
-                                    if fb2_resp.status_code == 429:
-                                        fb2_alt_key = env_key(model_cfg.get("fallback2_alternate_key_env", ""))
-                                        if fb2_alt_key:
-                                            log.warning("Fallback2 key rate-limited (429) - switching to alternate key")
-                                            alt_fb2_headers = {**fb2_headers, "Authorization": f"Bearer {fb2_alt_key}"}
-                                            async with client.stream(
-                                                "POST", fb2_url, json=fb2_payload, headers=alt_fb2_headers,
-                                                timeout=httpx.Timeout(fb2_cfg["timeout_seconds"]),
-                                            ) as alt_fb2_resp:
-                                                if alt_fb2_resp.status_code == 200:
-                                                    log.info("Alternate fallback2 key succeeded")
-                                                    async for line in alt_fb2_resp.aiter_lines():
-                                                        if line:
-                                                            yield f"{line}\n".encode()
-                                                        else:
-                                                            yield b"\n"
-                                                    return
-                                                else:
-                                                    fb2_body = await alt_fb2_resp.aread()
-                                                    fb2_error = fb2_body.decode(errors="replace")[:200]
-
-                                    yield f'data: {{"error":{{"message":"Fallbacks exhausted: {fallback_model}({fb_status}), {fb2_model}({fb2_resp.status_code}) - {fb2_error}","type":"upstream_error"}}}}\n\n'.encode()
-                                    yield b'data: [DONE]\n\n'
-                                    return
-                        else:
-                            yield f'data: {{"error":{{"message":"Fallback {fallback_model} failed: {resp.status_code}/{fb_resp.status_code} - {error_msg}","type":"upstream_error"}}}}\n\n'.encode()
-                            yield b'data: [DONE]\n\n'
-                            return
-            else:
-                body = await resp.aread()
-                error_msg = body.decode(errors="replace")[:300]
-                yield f'data: {{"error":{{"message":"Upstream {model_cfg["model"]} returned {resp.status_code}: {error_msg}","type":"upstream_error"}}}}\n\n'.encode()
-                yield b'data: [DONE]\n\n'
+        except (httpx.RemoteProtocolError, httpx.ReadError, httpx.ConnectError) as exc:
+            log.warning("Streaming %s transport error: %s", model_cfg["model"], exc)
+            cnt = _record_failure(key)
+            log.info("Session %s failure %s/%s", key, cnt, _RETRY_MAX_BEFORE_FALLBACK)
+            yield b'data: [DONE]\n\n'
 
 
 def route_request(cfg: dict, payload: dict) -> JSONResponse:
