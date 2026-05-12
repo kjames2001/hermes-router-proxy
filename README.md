@@ -22,7 +22,18 @@ An intelligent LLM routing proxy that classifies prompts as "simple" or "complex
 
 - **Multi-tier fallback cascade** — Primary → fallback1 → fallback2, each with independent base URL and API key
 - **API key rotation** — Automatic retry with alternate keys on HTTP 429 at every tier (primary, fallback1, fallback2)
-- **Circuit breakers** — Per-endpoint breaker trips after N consecutive 429s, recovers automatically after a configurable timeout (half-open state)
+- **503 retry with exponential backoff** — Sync path retries HTTP 503 up to 3x (2s/4s/8s) before escalating
+- **Transport retry** — Retryable errors (ConnectError, RemoteProtocolError, ReadTimeout, ConnectTimeout) retry up to 3x with 1s backoff
+- **Circuit breakers** — Per-endpoint breaker trips after N consecutive 429s/5xx, recovers automatically after a configurable timeout (half-open state)
+
+### Streaming Resilience (Transparent Proxy)
+
+The router-proxy acts as a **transparent SSE proxy** — no internal retry loops on the streaming path:
+
+- **Clean cut on failure** — When the inner stream breaks, the outer SSE is immediately closed with `data: [DONE]`. No backoff, no silence.
+- **Delegated retry** — The Hermes gateway's own `HERMES_STREAM_RETRIES` mechanism detects the clean close and reconnects with a fresh request.
+- **3-strike fallback** — A per-session failure counter tracks consecutive breaks. Only after **3 consecutive failures** does the next gateway retry skip the primary model and go directly to fallback. This means the router tries hard to reconnect to the primary (like a direct connection would), only downgrading when the endpoint is genuinely unhealthy.
+- **Auto-recovery** — A successful stream immediately resets the counter to zero.
 
 ### Observability
 
@@ -254,9 +265,21 @@ In `~/.hermes/config.yaml`:
 
 ```yaml
 model:
-  default: deepseek-v4-pro      # Must match a configured model name
-  provider: ollama-cloud
-  base_url: http://localhost:8766/v1   # ← point here instead of direct API
+  default: deepseek-v4-pro          # Primary model — router proxies to this or fallback
+  provider: auto-router             # Routes through the proxy
+
+# ── Custom provider block ───────────────────────────────────────────────────
+custom_providers:
+- name: auto-router
+  base_url: http://localhost:8766/v1
+  model: deepseek-v4-pro            # Must match one of the configured tier models
+
+# ── Fallback chain (gateway-level, fires if router-proxy is unreachable) ────
+fallback_providers:
+- provider: nous
+  model: qwen/qwen3.6-plus
+- provider: opencode-zen
+  model: big-pickle
 ```
 
 Then restart the Hermes gateway.
