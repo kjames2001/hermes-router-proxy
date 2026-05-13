@@ -1,0 +1,454 @@
+classifier:
+  model: ministral-3:3b
+  base_url: https://ollama.com/v1
+  api_key_env: OLLAMA_API_KEY
+  surrogate:
+    enabled: true
+    path: .router/surrogate
+    confidence_threshold: 0.85
+  profile_hint: "james is an ai agent who prefers clean, separated pull requests and\
+    \ tests code locally before submitting it upstream. he communicates directly and\
+    \ pragmatically in a mix of chinese and english, often addressing me as \u8001\
+    \u8D3E/jarvis. key tools include fast whisper for speech recognition, docker hub\
+    \ (kjames2001), and two youtube shorts channels with specific video dimensions\
+    \ and settings. his communication style is direct and human-oriented, avoiding\
+    \ fabrication on metrics or data."
+  system_prompt: "Classify as \"simple\" or \"complex\".\n\n\"Hello\" \u2192 simple\n\
+    \"Implement OAuth2\" \u2192 complex\n\"Thanks!\" \u2192 simple\n\"Debug nginx\
+    \ 502\" \u2192 complex\n\"What is Docker?\" \u2192 simple\n\"Deploy K8s cluster\"\
+    \ \u2192 complex\n\"Say hi\" \u2192 simple\n\"Write integration tests\" \u2192\
+    \ complex\n\"Refactor to async\" \u2192 complex\n\nSIMPLE = hi, thanks, what is,\
+    \ how are you, trivia, status check.\nCOMPLEX = implement, debug, deploy, refactor,\
+    \ build, configure, code, write, create.\n\n\"{message}\" \u2192\n"
+  session_timeout_minutes: 5
+models:
+  simple:
+    model: deepseek-v4-flash
+    base_url: https://ollama.com/v1
+    api_key_env: OLLAMA_API_KEY_2
+    alternate_key_env: OLLAMA_API_KEY
+    timeout_seconds: 120
+    fallback_model: kimi-k2.6
+    fallback_base_url: https://ollama.com/v1
+    fallback_key_env: OLLAMA_API_KEY_2
+    fallback2_model: big-pickle
+    fallback2_base_url: https://opencode.ai/zen/v1
+    fallback2_key_env: OPENCODE_ZEN_API_KEY
+    fallback_alternate_key_env: OLLAMA_API_KEY
+    fallback2_alternate_key_env: OLLAMA_API_KEY
+  complex:
+    model: deepseek-v4-pro
+    base_url: https://ollama.com/v1
+    api_key_env: OLLAMA_API_KEY
+    alternate_key_env: OLLAMA_API_KEY_2
+    timeout_seconds: 300
+    fallback_model: glm-5.1
+    fallback_base_url: https://ollama.com/v1
+    fallback_key_env: OLLAMA_API_KEY_2
+    fallback2_model: big-pickle
+    fallback2_base_url: https://opencode.ai/zen/v1
+    fallback2_key_env: OPENCODE_ZEN_API_KEY
+    fallback_alternate_key_env: OLLAMA_API_KEY
+    fallback2_alternate_key_env: OLLAMA_API_KEY
+routing:
+  escalation_keywords:
+  - implement
+  - refactor
+  - build
+  - write code
+  - generate code
+  - generate a
+  - code review
+  - write tests
+  - unit test
+  - integration test
+  - test suite
+  - create a PR
+  - create PR
+  - merge conflict
+  - cherry-pick
+  - rebase
+  - squash
+  - dependency
+  - pip install
+  - npm install
+  - requirements.txt
+  - package.json
+  - virtualenv
+  - venv
+  - poetry
+  - pipenv
+  - function
+  - class
+  - decorator
+  - async
+  - await
+  - generator
+  - iterator
+  - regex
+  - regular expression
+  - lambda
+  - callback
+  - middleware
+  - endpoint
+  - REST API
+  - GraphQL
+  - webhook
+  - API key
+  - OAuth
+  - JWT
+  - token refresh
+  - authentication
+  - authorization
+  - deploy
+  - configure
+  - set up
+  - setup
+  - migrate
+  - proxmox
+  - LXC
+  - container
+  - dockerfile
+  - docker-compose
+  - docker compose
+  - docker build
+  - docker run
+  - docker network
+  - docker volume
+  - kubernetes
+  - k8s
+  - helm
+  - namespace
+  - ingress
+  - reverse proxy
+  - nginx
+  - caddy
+  - traefik
+  - systemd service
+  - systemctl
+  - cron job
+  - crontab
+  - firewall
+  - iptables
+  - ufw
+  - DNS
+  - DNS record
+  - SSL
+  - TLS
+  - certificate
+  - certbot
+  - LetsEncrypt
+  - reverse tunnel
+  - tailnet
+  - tailscale
+  - Tailscale
+  - wireguard
+  - VPN
+  - port forward
+  - SSH key
+  - SSH config
+  - rsync
+  - backup
+  - restore backup
+  - snapshot
+  - clone
+  - replicate
+  - debug
+  - troubleshoot
+  - diagnose
+  - fix this
+  - fix the
+  - fix error
+  - not working
+  - why isn't
+  - why doesn't
+  - what's wrong
+  - what went wrong
+  - why did
+  - error
+  - crash
+  - crashed
+  - exception
+  - traceback
+  - stack trace
+  - segfault
+  - panic
+  - 502
+  - 500 error
+  - 503
+  - 404
+  - connection refused
+  - connection timed out
+  - timeout
+  - permission denied
+  - access denied
+  - OOM
+  - out of memory
+  - disk full
+  - disk space
+  - high CPU
+  - memory leak
+  - deadlock
+  - race condition
+  - architect
+  - architecture
+  - design a
+  - design the
+  - write a plan
+  - planning
+  - roadmap
+  - optimize
+  - performance
+  - scale
+  - scaling
+  - load balance
+  - rate limit
+  - cache strategy
+  - caching
+  - CDN
+  - disaster recovery
+  - security review
+  - vulnerability
+  - penetration test
+  - threat model
+  - add rate limit
+  - database schema
+  - db schema
+  - SQL
+  - query
+  - migration
+  - database migration
+  - indexing
+  - index
+  - replication
+  - replica
+  - primary key
+  - foreign key
+  - join
+  - aggregate
+  - ETL
+  - data pipeline
+  - ChromaDB
+  - collection
+  - vector store
+  - embedding
+  - embeddings
+  - similarity search
+  - automate
+  - automation
+  - script
+  - pipeline
+  - CI/CD
+  - GitHub Actions
+  - workflow
+  - trigger
+  - bot
+  - scheduler
+  - cron
+  - event-driven
+  - message queue
+  - RabbitMQ
+  - MQTT
+  - MQTT broker
+  - Home Assistant
+  - HA automation
+  - HA script
+  - blueprint
+  - ESPHome
+  - zigbee
+  - ZHA
+  - Z2M
+  - Zigbee2MQTT
+  - fine-tune
+  - finetune
+  - training
+  - model
+  - inference
+  - quantize
+  - quantization
+  - GGUF
+  - LoRA
+  - QLoRA
+  - DPO
+  - GRPO
+  - RAG
+  - embedding model
+  - tokenizer
+  - prompt engineering
+  - vLLM
+  - Ollama
+  - ComfyUI
+  - chain
+  - agent
+  - multi-agent
+  - tool calling
+  - function calling
+  - structured output
+  - JSON schema
+  - Pydantic
+  de_escalation_keywords:
+  - thanks
+  - thank you
+  - thx
+  - ty
+  - thanks a lot
+  - appreciate it
+  - got it
+  - understood
+  - makes sense
+  - perfect
+  - excellent
+  - wonderful
+  - brilliant
+  - well done
+  - good job
+  - nice
+  - nice work
+  - cool
+  - sweet
+  - awesome
+  - great
+  - amazing
+  - fantastic
+  - lovely
+  - cheers
+  - "\u8C22\u8C22"
+  - "\u8C22\u8C22\u4F60"
+  - "\u611F\u8C22"
+  - "\u591A\u8C22"
+  - "\u660E\u767D\u4E86"
+  - "\u61C2\u4E86"
+  - "\u6536\u5230"
+  - "\u597D\u7684"
+  - "\u53EF\u4EE5"
+  - "\u4E0D\u9519"
+  - "\u5F88\u68D2"
+  - "\u597D"
+  - "\u884C"
+  - "\u55EF"
+  - "\u54E6"
+  - good morning
+  - good afternoon
+  - good evening
+  - good night
+  - hello
+  - hey
+  - hi
+  - how are you
+  - how's it going
+  - how do you do
+  - what's up
+  - wassup
+  - yo
+  - morning
+  - evening
+  - bye
+  - goodbye
+  - see you
+  - later
+  - take care
+  - "\u65E9\u4E0A\u597D"
+  - "\u65E9\u5B89"
+  - "\u4E0B\u5348\u597D"
+  - "\u665A\u4E0A\u597D"
+  - "\u665A\u5B89"
+  - "\u4F60\u597D"
+  - "\u55E8"
+  - "\u54C8\u55BD"
+  - "\u518D\u89C1"
+  - "\u62DC\u62DC"
+  - "\u660E\u5929\u89C1"
+  - "\u56DE\u5934\u89C1"
+  - "\u4FDD\u91CD"
+  - "\u5403\u4E86\u5417"
+  - "\u5728\u5417"
+  - "\u5728\u4E0D"
+  - "\u5E72\u561B\u5462"
+  - what does
+  - what is
+  - what's a
+  - what's the meaning
+  - what does it mean
+  - define
+  - definition of
+  - explain simply
+  - in simple terms
+  - how do I spell
+  - "\u4EC0\u4E48\u662F"
+  - "\u662F\u4EC0\u4E48"
+  - "\u4EC0\u4E48\u610F\u601D"
+  - "\u600E\u4E48\u7406\u89E3"
+  - "\u4E3E\u4E2A\u4F8B\u5B50"
+  - "\u89E3\u91CA\u4E00\u4E0B"
+  - "\u7B80\u5355\u8BF4"
+  - "\u5B9A\u4E49"
+  - "\u4EC0\u4E48\u610F\u601D"
+  - "\u600E\u4E48\u8BF4"
+  - "\u600E\u4E48\u62FC"
+  - "\u600E\u4E48\u8BFB"
+  - lol
+  - lmao
+  - haha
+  - hehe
+  - rofl
+  - ok
+  - okay
+  - sure
+  - alright
+  - yep
+  - yeah
+  - nope
+  - nah
+  - yea
+  - yup
+  - mhm
+  - uh huh
+  - "\u54C8\u54C8"
+  - "\u5475\u5475"
+  - "\u563F\u563F"
+  - "\u597D\u5427"
+  - "\u884C\u5427"
+  - "\u53EF\u4EE5\u53EF\u4EE5"
+  - "\u6CA1\u95EE\u9898"
+  - "\u662F\u7684"
+  - "\u5BF9\u7684"
+  - "\u4E0D\u662F"
+  - "\u6CA1\u6709"
+  - "\u55EF\u55EF"
+  - "\u54E6\u54E6"
+  - what time
+  - what day
+  - what date
+  - what's the date
+  - what's the weather
+  - is it raining
+  - is it up
+  - is it running
+  - uptime
+  - "\u51E0\u70B9"
+  - "\u51E0\u53F7"
+  - "\u4ECA\u5929\u51E0\u53F7"
+  - "\u4ECA\u5929\u661F\u671F\u51E0"
+  - "\u4EC0\u4E48\u5929\u6C14"
+  - "\u4E0B\u96E8\u5417"
+  - "\u70ED\u5417"
+  - "\u51B7\u5417"
+  - "\u8FD8\u6D3B\u7740\u5417"
+  - "\u5728\u8FD0\u884C\u5417"
+  - "\u6B63\u5E38\u5417"
+  - "\u72B6\u6001"
+  - "\u8FD0\u884C\u591A\u4E45\u4E86"
+auth:
+  api_key_env: ROUTER_PROXY_API_KEY
+server:
+  port: 8766
+  host: 0.0.0.0
+persona:
+  user_path: /root/.hermes/memories/USER.md
+  memory_path: /root/.hermes/memories/MEMORY.md
+  max_context_chars: 800
+tracing:
+  enabled: true
+  path: .router/traces.jsonl
+  max_input_chars: 500
+  max_file_mb: 50
