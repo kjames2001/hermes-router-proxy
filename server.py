@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import json
 import logging
 import os
 import re
@@ -235,13 +236,171 @@ def _write_config_back(cfg: dict) -> None:
     log.info("Wrote updated router_config.yaml with profile_hint")
 
 
+# ── Surrogate Classifier (TRACER-inspired acceptor gate) ────────────────────
+
+class SurrogateClassifier:
+    """
+    ML surrogate that replaces the LLM classifier for confident predictions.
+
+    Loads a fitted sklearn pipeline + calibrated acceptor from .router/surrogate/.
+    On each classification request:
+      1. Predict with the pipeline → label + confidence
+      2. If confidence >= threshold → use surrogate prediction (fast, free)
+      3. If confidence < threshold → fall back to LLM classifier (accurate)
+
+    This is the "acceptor gate" from the TRACER paper: calibrated probability
+    threshold determines which inputs are safe to route via the cheap surrogate
+    vs. which need the expensive teacher model.
+    """
+
+    def __init__(self, surrogate_dir: Path, confidence_threshold: float = 0.85):
+        self.pipeline = None
+        self.acceptor = None
+        self.confidence_threshold = confidence_threshold
+        self.manifest: dict[str, Any] = {}
+        self._loaded = False
+        self._load(surrogate_dir)
+
+    def _load(self, surrogate_dir: Path) -> None:
+        """Try to load pipeline + acceptor from disk. Silent on failure."""
+        manifest_path = surrogate_dir / "manifest.json"
+        pipeline_path = surrogate_dir / "pipeline.joblib"
+        acceptor_path = surrogate_dir / "acceptor.joblib"
+
+        if not manifest_path.exists() or not pipeline_path.exists():
+            log.info("Surrogate not found at %s — LLM-only classification", surrogate_dir)
+            return
+
+        try:
+            import joblib as _joblib
+
+            self.manifest = json.loads(manifest_path.read_text())
+            self.pipeline = _joblib.load(pipeline_path)
+
+            if acceptor_path.exists():
+                self.acceptor = _joblib.load(acceptor_path)
+                # Use threshold from manifest if available
+                self.confidence_threshold = self.manifest.get(
+                    "acceptor_threshold", self.confidence_threshold
+                )
+
+            self._loaded = True
+            log.info(
+                "Surrogate loaded: %s (CV accuracy=%.4f, coverage=%.1f%%, threshold=%.4f)",
+                self.manifest.get("surrogate_method", "unknown"),
+                self.manifest.get("cv_accuracy", 0),
+                self.manifest.get("coverage", 0) * 100,
+                self.confidence_threshold,
+            )
+        except Exception as exc:
+            log.warning("Failed to load surrogate from %s: %s", surrogate_dir, exc)
+            self.pipeline = None
+            self.acceptor = None
+            self._loaded = False
+
+    @property
+    def is_available(self) -> bool:
+        return self._loaded and self.pipeline is not None
+
+    def predict(self, text: str) -> tuple[str, float]:
+        """
+        Predict label and confidence for input text.
+        Returns (label, confidence) — e.g. ("simple", 0.97).
+        Falls back to ("simple", 0.0) on any error.
+        """
+        if not self._loaded or self.pipeline is None:
+            return "simple", 0.0
+
+        try:
+            # Pipeline prediction
+            label = self.pipeline.predict([text])[0]
+
+            # Confidence from acceptor (calibrated) or pipeline predict_proba
+            if self.acceptor is not None:
+                probas = self.acceptor.predict_proba([text])[0]
+                confidence = float(max(probas))
+            elif hasattr(self.pipeline, "predict_proba"):
+                probas = self.pipeline.predict_proba([text])[0]
+                confidence = float(max(probas))
+            else:
+                # No probability available — use decision function distance
+                confidence = 1.0  # Assume confident if we got this far
+
+            return str(label), confidence
+
+        except Exception as exc:
+            log.warning("Surrogate predict error: %s", exc)
+            return "simple", 0.0
+
+
+# ── Global surrogate instance (lazy-loaded) ─────────────────────────────────
+_surrogate: SurrogateClassifier | None = None
+
+
+def _get_surrogate(cfg: dict) -> SurrogateClassifier | None:
+    """Return the singleton surrogate, initializing from config if needed."""
+    global _surrogate
+    surrogate_cfg = cfg.get("classifier", {}).get("surrogate", {})
+    if not surrogate_cfg.get("enabled", False):
+        return None
+    if _surrogate is None:
+        surrogate_dir = Path(surrogate_cfg.get("path", ".router/surrogate"))
+        if not surrogate_dir.is_absolute():
+            surrogate_dir = CONFIG_DIR / surrogate_dir
+        threshold = surrogate_cfg.get("confidence_threshold", 0.85)
+        _surrogate = SurrogateClassifier(surrogate_dir, confidence_threshold=threshold)
+    return _surrogate if _surrogate.is_available else None
+
+
 # ── Classification ──────────────────────────────────────────────────────────
 
 def classify(cfg: dict, user_message: str, *, session_key: str | None = None, is_first: bool = True) -> str:
     """
-    Ask the flash classifier: "simple" or "complex"?
+    Classify a user message as "simple" or "complex".
+
+    Uses the TRACER-inspired acceptor gate:
+      1. Try ML surrogate first (fast, free, ~0.1ms)
+      2. If surrogate confidence >= threshold → use its prediction
+      3. If surrogate confidence < threshold → fall back to LLM classifier
+
+    Falls back to LLM classifier entirely if no surrogate is loaded.
     Returns "simple" as safe default on any failure.
     """
+    surrogate = _get_surrogate(cfg)
+
+    if surrogate is not None:
+        label, confidence = surrogate.predict(user_message)
+        if confidence >= surrogate.confidence_threshold:
+            # Surrogate is confident — skip LLM classifier entirely
+            latency_ms = 0.1  # ~sub-ms inference
+            _record_classifier_latency(latency_ms)
+
+            log.info(
+                "Surrogate classified: '%s' → %s (%.2f confidence, threshold %.2f)",
+                user_message[:60], label, confidence, surrogate.confidence_threshold,
+            )
+
+            # Trace: surrogate decision (fast path)
+            trace_classify(
+                session_key=session_key or "?",
+                user_message=user_message,
+                classifier_result=label,
+                classifier_raw=f"surrogate:{confidence:.4f}",
+                latency_ms=latency_ms,
+                tier=label,
+                model=f"surrogate/{surrogate.manifest.get('surrogate_method', 'unknown')}",
+                is_first=is_first,
+            )
+
+            return label
+        else:
+            # Surrogate uncertain — fall through to LLM
+            log.info(
+                "Surrogate uncertain: '%s' (%.2f < %.2f threshold) — deferring to LLM",
+                user_message[:60], confidence, surrogate.confidence_threshold,
+            )
+
+    # ── LLM classifier (slow path or no surrogate) ─────────────────────
     t0 = time.time()
     prompt = build_classification_prompt(cfg, user_message)
     result = _call_classifier_raw(cfg, prompt, max_tokens=32)
@@ -251,7 +410,7 @@ def classify(cfg: dict, user_message: str, *, session_key: str | None = None, is
     tier = "complex" if "complex" in result else "simple"
     model = cfg["models"][tier]["model"]
 
-    # ── Trace: classification decision ─────────────────────────────────
+    # ── Trace: LLM classification decision ─────────────────────────────
     trace_classify(
         session_key=session_key or "?",
         user_message=user_message,
@@ -753,70 +912,179 @@ async def route_request_stream(cfg: dict, payload: dict):
                 )
 
     model_cfg = cfg["models"][tier]
-    log.info("Streaming session %s → %s (%s)", key, tier, model_cfg["model"])
 
-    # ── Retry check: after N consecutive failures, use fallback ────────
-    fallback_model = model_cfg.get("fallback_model")
-    if _should_use_fallback(key) and fallback_model:
-        log.info("Session %s has %s consecutive failures — using fallback %s",
-                 key, _RETRY_STATE[key], fallback_model)
-        model_cfg = dict(model_cfg)  # don't mutate original
-        model_cfg["model"] = fallback_model
-        model_cfg["base_url"] = model_cfg["fallback_base_url"]
-        model_cfg["api_key_env"] = model_cfg.get("fallback_key_env", model_cfg["api_key_env"])
-        model_cfg["alternate_key_env"] = model_cfg.get("fallback_alternate_key_env", "")
+    # ── Build tier attempt list: primary, fallback1, fallback2 ─────────
+    # Each entry: (label, model_cfg_dict)
+    # If session has N consecutive failures, skip primary and start at fallback.
+    tier_attempts: list[tuple[str, dict]] = []
 
-    # ── Open inner stream, forward everything, no internal retries ────
+    # Skip primary if session has too many consecutive failures
+    if _should_use_fallback(key):
+        fallback_model_name = model_cfg.get("fallback_model")
+        if fallback_model_name:
+            log.info("Session %s has %s consecutive failures — skipping primary %s",
+                     key, _RETRY_STATE[key], model_cfg["model"])
+        else:
+            tier_attempts.append(("primary", model_cfg))
+    else:
+        tier_attempts.append(("primary", model_cfg))
+
+    # Fallback 1
+    fb_model = model_cfg.get("fallback_model")
+    if fb_model:
+        fb1_cfg = {
+            "model": fb_model,
+            "base_url": model_cfg["fallback_base_url"],
+            "api_key_env": model_cfg.get("fallback_key_env", ""),
+            "alternate_key_env": model_cfg.get("fallback_alternate_key_env", ""),
+            "timeout_seconds": model_cfg.get("timeout_seconds", 120),
+            "tier": tier,
+        }
+        tier_attempts.append(("fallback1", fb1_cfg))
+
+    # Fallback 2
+    fb2_model = model_cfg.get("fallback2_model")
+    if fb2_model:
+        fb2_cfg = {
+            "model": fb2_model,
+            "base_url": model_cfg["fallback2_base_url"],
+            "api_key_env": model_cfg.get("fallback2_key_env", ""),
+            "alternate_key_env": model_cfg.get("fallback2_alternate_key_env", ""),
+            "timeout_seconds": model_cfg.get("timeout_seconds", 120),
+            "tier": tier,
+        }
+        tier_attempts.append(("fallback2", fb2_cfg))
+
+    # ── Try each tier in order until one streams successfully ───────────
     async with httpx.AsyncClient() as client:
-        url = f"{model_cfg['base_url'].rstrip('/')}/chat/completions"
-        api_key = env_key(model_cfg["api_key_env"])
-        timeout = model_cfg.get("timeout_seconds", 120)
-        stream_payload = {**payload, "model": model_cfg["model"]}
-        headers: dict[str, str] = {"Content-Type": "application/json"}
-        if api_key:
-            headers["Authorization"] = f"Bearer {api_key}"
+        for attempt_label, attempt_cfg in tier_attempts:
+            model_name = attempt_cfg["model"]
+            log.info("Streaming attempt %s: %s → %s", attempt_label, key, model_name)
 
-        try:
-            async with client.stream(
-                "POST", url, json=stream_payload, headers=headers,
-                timeout=httpx.Timeout(timeout),
-            ) as resp:
-                if resp.status_code != 200:
-                    err_body = await resp.aread()
-                    err_text = err_body.decode(errors="replace")[:300]
-                    log.warning("Streaming upstream returned %d: %s", resp.status_code, err_text[:150])
-                    trace_route(
-                        session_key=key, tier=tier, model=model_cfg["model"],
-                        upstream_status=resp.status_code, stream=True,
-                    )
-                    yield f'data: {{"error":{{"message":"Upstream {resp.status_code}: {err_text}","type":"upstream_error"}}}}\n\n'.encode()
-                    yield b'data: [DONE]\n\n'
-                    return
-
-                log.info("Streaming %s OK", model_cfg["model"])
+            # Circuit breaker check
+            base_url = attempt_cfg["base_url"].rstrip("/")
+            if _circuit_is_open(cfg, base_url):
+                log.warning("Circuit open for %s — skipping %s", base_url, model_name)
                 trace_route(
-                    session_key=key, tier=tier, model=model_cfg["model"],
-                    upstream_status=200, stream=True,
+                    session_key=key, tier=tier, model=model_name,
+                    upstream_status=429, stream=True,
+                    fallback_level=tier_attempts.index((attempt_label, attempt_cfg)) + 1,
                 )
-                async for line in resp.aiter_lines():
-                    if line:
-                        yield f"{line}\n".encode()
-                    else:
-                        yield b"\n"
-                # Success — clear the failure counter
-                _clear_retry(key)
-                return  # clean completion
+                _inc_metric_tier(tier, "429")
+                continue  # try next tier
 
-        except (httpx.RemoteProtocolError, httpx.ReadError, httpx.ConnectError) as exc:
-            log.warning("Streaming %s transport error: %s", model_cfg["model"], exc)
-            cnt = _record_failure(key)
-            trace_stream_error(
-                session_key=key, model=model_cfg["model"],
-                error=str(exc), failure_count=cnt,
-                max_failures=_RETRY_MAX_BEFORE_FALLBACK,
-            )
-            log.info("Session %s failure %s/%s", key, cnt, _RETRY_MAX_BEFORE_FALLBACK)
-            yield b'data: [DONE]\n\n'
+            stream_url = f"{base_url}/chat/completions"
+            api_key = env_key(attempt_cfg["api_key_env"])
+            alt_key = env_key(attempt_cfg.get("alternate_key_env", ""))
+            timeout = attempt_cfg.get("timeout_seconds", 120)
+            stream_payload = {**payload, "model": model_name}
+            headers: dict[str, str] = {"Content-Type": "application/json"}
+            if api_key:
+                headers["Authorization"] = f"Bearer {api_key}"
+
+            # ── Key rotation: if primary key gets 429, try alternate ────
+            key_attempts = [(api_key, "primary_key")] if api_key else [(None, "no_key")]
+            if alt_key:
+                key_attempts.append((alt_key, "alternate_key"))
+
+            for key_val, key_label in key_attempts:
+                if key_val:
+                    headers["Authorization"] = f"Bearer {key_val}"
+
+                try:
+                    async with client.stream(
+                        "POST", stream_url, json=stream_payload, headers=headers,
+                        timeout=httpx.Timeout(timeout),
+                    ) as resp:
+
+                        if resp.status_code == 429:
+                            err_body = await resp.aread()
+                            err_text = err_body.decode(errors="replace")[:200]
+                            log.warning("Streaming %s got 429 (%s key): %s",
+                                        model_name, key_label, err_text[:100])
+                            _circuit_record_failure(cfg, base_url)
+                            _inc_metric_tier(tier, "429")
+                            _inc_metric("429_total")
+
+                            if key_label == "primary_key" and alt_key:
+                                trace_key_rotation(
+                                    base_url=base_url, tier=tier,
+                                    reason="429_rate_limit_stream",
+                                )
+                                continue  # try alternate key
+
+                            trace_route(
+                                session_key=key, tier=tier, model=model_name,
+                                upstream_status=429, stream=True,
+                                fallback_level=tier_attempts.index((attempt_label, attempt_cfg)) + 1,
+                            )
+                            break  # both keys 429'd, try next tier
+
+                        if resp.status_code != 200:
+                            err_body = await resp.aread()
+                            err_text = err_body.decode(errors="replace")[:300]
+                            log.warning("Streaming %s returned %d: %s",
+                                        model_name, resp.status_code, err_text[:150])
+                            _circuit_record_failure(cfg, base_url)
+                            trace_route(
+                                session_key=key, tier=tier, model=model_name,
+                                upstream_status=resp.status_code, stream=True,
+                            )
+                            break  # non-429 error on this tier, try next
+
+                        # ── Stream successfully opened ───────────────────
+                        log.info("Streaming %s OK (key=%s)", model_name, key_label)
+                        if key_label == "alternate_key":
+                            _circuit_record_success(cfg, base_url)
+                        trace_route(
+                            session_key=key, tier=tier, model=model_name,
+                            upstream_status=200, stream=True,
+                        )
+                        if attempt_label != "primary":
+                            _inc_metric("fallback_used_total" if attempt_label == "fallback1" else "fallback2_used_total")
+
+                        try:
+                            async for line in resp.aiter_lines():
+                                if line:
+                                    yield f"{line}\n".encode()
+                                else:
+                                    yield b"\n"
+                            _clear_retry(key)
+                            return  # clean completion
+
+                        except (httpx.RemoteProtocolError, httpx.ReadError, httpx.ConnectError) as stream_exc:
+                            # Mid-stream break — close cleanly, let gateway retry
+                            log.warning("Stream interrupted for %s: %s", model_name, stream_exc)
+                            cnt = _record_failure(key)
+                            trace_stream_error(
+                                session_key=key, model=model_name,
+                                error=str(stream_exc), failure_count=cnt,
+                                max_failures=_RETRY_MAX_BEFORE_FALLBACK,
+                            )
+                            yield b'data: [DONE]\n\n'
+                            return  # gateway's HERMES_STREAM_RETRIES handles retry
+
+                except (httpx.RemoteProtocolError, httpx.ReadError, httpx.ConnectError) as exc:
+                    log.warning("Streaming %s transport error: %s", model_name, exc)
+                    cnt = _record_failure(key)
+                    trace_stream_error(
+                        session_key=key, model=model_name,
+                        error=str(exc), failure_count=cnt,
+                        max_failures=_RETRY_MAX_BEFORE_FALLBACK,
+                    )
+                    # Don't return — try next tier
+                    continue
+
+                except httpx.ConnectTimeout as exc:
+                    log.warning("Streaming %s connect timeout: %s", model_name, exc)
+                    continue
+
+            # key_attempts exhausted for this tier — move to next tier
+
+    # ── All tiers exhausted ────────────────────────────────────────
+    log.error("All streaming tiers exhausted for session %s", key)
+    yield f'data: {{"error":{{"message":"All upstream models failed","type":"upstream_error"}}}}\n\n'.encode()
+    yield b'data: [DONE]\n\n'
 
 
 def route_request(cfg: dict, payload: dict) -> JSONResponse:
