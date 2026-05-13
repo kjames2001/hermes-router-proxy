@@ -442,7 +442,7 @@ def _fuzzy_match(keyword: str, text: str) -> bool:
     2. Normalised substring.
     3. Levenshtein distance ≤1 for keywords ≥5 chars.
     """
-    n_key = keyword.lower().strip()
+    n_key = str(keyword).lower().strip()
     n_text = text.lower()
 
     # 1. Exact substring

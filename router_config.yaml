@@ -173,10 +173,10 @@ routing:
   - stack trace
   - segfault
   - panic
-  - 502
+  - "502"
   - 500 error
-  - 503
-  - 404
+  - "503"
+  - "404"
   - connection refused
   - connection timed out
   - timeout
