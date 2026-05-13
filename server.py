@@ -16,6 +16,7 @@ License: MIT
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import hashlib
 import json
@@ -557,15 +558,18 @@ CB_DEFAULTS: dict[str, int] = {
 }
 
 
-def _circuit_key(base_url: str) -> str:
-    """Normalize a base_url into a circuit breaker key."""
-    return base_url.rstrip("/").replace("://", "_").replace("/", "_").replace(".", "_")
+def _circuit_key(base_url: str, model: str = "") -> str:
+    """Normalize a base_url (+ optional model) into a circuit breaker key."""
+    key = base_url.rstrip("/").replace("://", "_").replace("/", "_").replace(".", "_")
+    if model:
+        key = f"{key}__{model}"
+    return key
 
 
-def _circuit_is_open(cfg: dict, base_url: str) -> bool:
+def _circuit_is_open(cfg: dict, base_url: str, model: str = "") -> bool:
     """Check whether the circuit for this endpoint is currently open."""
     cb_cfg = cfg.get("circuit_breaker", CB_DEFAULTS)
-    key = _circuit_key(base_url)
+    key = _circuit_key(base_url, model)
     entry = CIRCUITS.get(key)
     if not entry:
         return False
@@ -583,9 +587,9 @@ def _circuit_is_open(cfg: dict, base_url: str) -> bool:
     return True
 
 
-def _circuit_record_success(cfg: dict, base_url: str) -> None:
+def _circuit_record_success(cfg: dict, base_url: str, model: str = "") -> None:
     """Reset the circuit breaker after a successful request."""
-    key = _circuit_key(base_url)
+    key = _circuit_key(base_url, model)
     entry = CIRCUITS.get(key)
     if entry and entry["state"] == "half_open":
         log.info("Circuit %s → closed (success in half-open)", key)
@@ -595,10 +599,10 @@ def _circuit_record_success(cfg: dict, base_url: str) -> None:
     CIRCUITS[key] = {"state": "closed", "failures": 0, "last_failure_at": 0}
 
 
-def _circuit_record_failure(cfg: dict, base_url: str) -> None:
+def _circuit_record_failure(cfg: dict, base_url: str, model: str = "") -> None:
     """Record a failure (429) and potentially open the circuit."""
     cb_cfg = cfg.get("circuit_breaker", CB_DEFAULTS)
-    key = _circuit_key(base_url)
+    key = _circuit_key(base_url, model)
     entry = CIRCUITS.get(key, {"state": "closed", "failures": 0, "last_failure_at": 0})
     now = time.time()
     window = cb_cfg.get("window_sec", 60)
@@ -736,9 +740,10 @@ def call_model(
     """
     base_url = model_cfg["base_url"].rstrip("/")
     url = f"{base_url}/chat/completions"
+    model_name = model_cfg["model"]
 
-    # Circuit breaker check
-    if _circuit_is_open(cfg, base_url):
+    # Circuit breaker check (keyed per base_url+model so one 503 model doesn't block others on same host)
+    if _circuit_is_open(cfg, base_url, model_name):
         log.warning("Circuit open for %s — skipping call", base_url)
         _inc_metric_tier(model_cfg.get("tier", "unknown"), "429")
         _inc_metric("429_total")
@@ -788,13 +793,13 @@ def call_model(
 
     # Circuit + metric tracking
     if resp.status_code == 429:
-        _circuit_record_failure(cfg, base_url)
+        _circuit_record_failure(cfg, base_url, model_name)
         _inc_metric_tier(model_cfg.get("tier", "unknown"), "429")
         _inc_metric("429_total")
     elif resp.status_code in (502, 503, 504):
-        _circuit_record_failure(cfg, base_url)
+        _circuit_record_failure(cfg, base_url, model_name)
     elif resp.status_code == 200:
-        _circuit_record_success(cfg, base_url)
+        _circuit_record_success(cfg, base_url, model_name)
 
     # Key rotation: HTTP 429 with alternate key available -> retry
     if resp.status_code == 429 and alt_key:
@@ -815,7 +820,7 @@ def call_model(
             pass
         if resp.status_code == 200:
             log.info("Alternate key succeeded")
-            _circuit_record_success(cfg, base_url)
+            _circuit_record_success(cfg, base_url, model_name)
 
     return resp
 
@@ -966,9 +971,9 @@ async def route_request_stream(cfg: dict, payload: dict):
             model_name = attempt_cfg["model"]
             log.info("Streaming attempt %s: %s → %s", attempt_label, key, model_name)
 
-            # Circuit breaker check
+            # Circuit breaker check (per model so one 503 model doesn't block siblings on same host)
             base_url = attempt_cfg["base_url"].rstrip("/")
-            if _circuit_is_open(cfg, base_url):
+            if _circuit_is_open(cfg, base_url, model_name):
                 log.warning("Circuit open for %s — skipping %s", base_url, model_name)
                 trace_route(
                     session_key=key, tier=tier, model=model_name,
@@ -1007,7 +1012,7 @@ async def route_request_stream(cfg: dict, payload: dict):
                             err_text = err_body.decode(errors="replace")[:200]
                             log.warning("Streaming %s got 429 (%s key): %s",
                                         model_name, key_label, err_text[:100])
-                            _circuit_record_failure(cfg, base_url)
+                            _circuit_record_failure(cfg, base_url, model_name)
                             _inc_metric_tier(tier, "429")
                             _inc_metric("429_total")
 
@@ -1028,9 +1033,64 @@ async def route_request_stream(cfg: dict, payload: dict):
                         if resp.status_code != 200:
                             err_body = await resp.aread()
                             err_text = err_body.decode(errors="replace")[:300]
+
+                            # 503 retry with backoff before falling to next tier
+                            if resp.status_code == 503:
+                                for retry_i, backoff in enumerate([2.0, 4.0, 8.0]):
+                                    log.warning(
+                                        "Streaming %s got 503 (attempt %d/4) — backing off %.0fs: %s",
+                                        model_name, retry_i + 2, backoff, err_text[:80],
+                                    )
+                                    await asyncio.sleep(backoff)
+                                    # Retry the stream request
+                                    retry_headers = dict(headers)
+                                    if key_val:
+                                        retry_headers["Authorization"] = f"Bearer {key_val}"
+                                    try:
+                                        async with client.stream(
+                                            "POST", stream_url, json=stream_payload, headers=retry_headers,
+                                            timeout=httpx.Timeout(timeout),
+                                        ) as retry_resp:
+                                            if retry_resp.status_code == 200:
+                                                log.info("Streaming %s OK after 503 retry %d", model_name, retry_i + 2)
+                                                _circuit_record_success(cfg, base_url, model_name)
+                                                trace_route(
+                                                    session_key=key, tier=tier, model=model_name,
+                                                    upstream_status=200, stream=True,
+                                                )
+                                                if attempt_label != "primary":
+                                                    _inc_metric("fallback_used_total" if attempt_label == "fallback1" else "fallback2_used_total")
+                                                try:
+                                                    async for line in retry_resp.aiter_lines():
+                                                        if line:
+                                                            yield f"{line}\n".encode()
+                                                        else:
+                                                            yield b"\n"
+                                                    _clear_retry(key)
+                                                    return  # clean completion
+                                                except (httpx.RemoteProtocolError, httpx.ReadError, httpx.ConnectError) as stream_exc:
+                                                    log.warning("Stream interrupted for %s after 503 retry: %s", model_name, stream_exc)
+                                                    cnt = _record_failure(key)
+                                                    trace_stream_error(
+                                                        session_key=key, model=model_name,
+                                                        error=str(stream_exc), failure_count=cnt, max_failures=3,
+                                                    )
+                                                    break  # mid-stream break after 503 retry, try next tier
+                                            elif retry_resp.status_code == 429:
+                                                _ = await retry_resp.aread()
+                                                # 429 on retry — record and break to next key/tier
+                                                _circuit_record_failure(cfg, base_url, model_name)
+                                                break
+                                            # Non-200, non-429 — continue retrying
+                                            err_body = await retry_resp.aread()
+                                            err_text = err_body.decode(errors="replace")[:300]
+                                    except (httpx.RemoteProtocolError, httpx.ConnectError, httpx.ReadError, httpx.ConnectTimeout):
+                                        continue  # transport error on retry, try again
+                                # All 503 retries exhausted — fall through to next tier
+                                _circuit_record_failure(cfg, base_url, model_name)
+
                             log.warning("Streaming %s returned %d: %s",
                                         model_name, resp.status_code, err_text[:150])
-                            _circuit_record_failure(cfg, base_url)
                             trace_route(
                                 session_key=key, tier=tier, model=model_name,
                                 upstream_status=resp.status_code, stream=True,
@@ -1040,7 +1100,7 @@ async def route_request_stream(cfg: dict, payload: dict):
                         # ── Stream successfully opened ───────────────────
                         log.info("Streaming %s OK (key=%s)", model_name, key_label)
                         if key_label == "alternate_key":
-                            _circuit_record_success(cfg, base_url)
+                            _circuit_record_success(cfg, base_url, model_name)
                         trace_route(
                             session_key=key, tier=tier, model=model_name,
                             upstream_status=200, stream=True,
