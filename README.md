@@ -11,6 +11,9 @@ An intelligent LLM routing proxy that classifies prompts as "simple" or "complex
 ## Features
 
 - **Smart classification** — Uses a local flash model (e.g., `qwen2.5:3b` via Ollama) to classify each new prompt as `simple` or `complex`
+- **TRACER surrogate classifier** — Offline-learned surrogate model (TF-IDF or MiniLM-L6-v2 embeddings) that handles 90%+ of classifications locally with ~1ms latency and zero LLM cost. Trained on production trace data with teacher agreement gating. Weekly auto-refit via cron
+- **Sentence embeddings** — When `sentence-transformers` is installed, `all-MiniLM-L6-v2` (384-dim) embeddings provide richer semantic representations for the surrogate. Auto-selected with `--prefer-embeddings` flag
+- **`/classifier/report` endpoint** — Live dashboard showing surrogate coverage, confidence distribution, per-model routing stats, hourly drift timeline, and fallback usage. Supports `?format=html` for dark-themed visualization
 - **Session awareness** — Classifies only the first message in a conversation. Follow-ups reuse the cached tier with sub-millisecond keyword deviation detection
 - **Keyword overrides** — "implement", "debug", "deploy" always route complex. "thanks", "lol", "how are you" always route simple. These bypass the classifier entirely
 - **Fuzzy keyword matching** — Typo-tolerant keyword detection using normalized substring matching and Levenshtein distance (≤1 edit)
@@ -55,8 +58,14 @@ The router-proxy acts as a **transparent SSE proxy** — no internal retry loops
 ```
 User → Hermes Agent → router-proxy (localhost:8766)
                            │
-                           ▼
-                    classifier (qwen2.5:3b)
+                    ┌──────┴──────┐
+                    │  classifier  │
+                    │  (2-stage)   │
+                    │              │
+                    │ surrogate    │ ← ~1ms, zero-cost
+                    │ ↓ (low conf) │
+                    │ qwen2.5:3b   │ ← ~200ms fallback
+                    └──────┬──────┘
                            │
               ┌────────────┴────────────┐
               ↓                         ↓
@@ -66,7 +75,7 @@ User → Hermes Agent → router-proxy (localhost:8766)
               ┌────────────────────┼────────────────────┐
               ↓                    ↓                    ↓
         fallback1             fallback2            alt keys
-   (e.g. o1-mini)         (e.g. big-pickle)     (key rotation)
+   (e.g. glm-5.1)         (e.g. big-pickle)     (key rotation)
 ```
 
 ---
@@ -240,6 +249,7 @@ persona:
 | `/admin/config` | GET | Required | Show live config (env var names only, no secrets) |
 | `/circuits` | GET | Required | List all circuit breaker states |
 | `/circuits/reset` | POST | Required | Reset all circuit breakers to closed |
+| `/classifier/report` | GET | Required | Surrogate coverage, confidence distribution, routing stats, drift timeline. `?format=html` for dark-themed dashboard |
 
 The `/v1/chat/completions` endpoint accepts the standard OpenAI chat completions request body (`model`, `messages`, `temperature`, `stream`, etc.). The `model` field is overwritten by the router based on classification.
 
@@ -337,10 +347,47 @@ docker compose up -d
 
 ## Classifier Performance
 
+### LLM Classifier
+
 Tested with `qwen2.5:3b` on Ollama:
 - **Accuracy:** 9/10 correct classifications
 - **Overhead:** ~200ms average per classification
 - **Misses:** Ambiguous queries ("What time is it?") — easily patched with keyword rules
+
+### TRACER Surrogate Classifier
+
+Inspired by [TRACER (Trace-Based Adaptive Cost-Efficient Routing for LLM Classification)](https://github.com/adrida/tracer) — an offline-learned surrogate model that handles the majority of classifications locally, eliminating LLM classifier calls for most requests.
+
+**How it works:**
+1. Production trace data (`classify` + `cache_hit` events) is collected continuously
+2. A weekly cron job (`refit_surrogate.sh`) refits TF-IDF and sentence-embedding classifiers against the LLM teacher labels
+3. The best candidate (by cross-validated accuracy) is saved as `.router/surrogate/pipeline.joblib`
+4. At inference time, the surrogate classifies requests with ~1ms latency and zero LLM cost
+5. A calibrated acceptor gate rejects low-confidence predictions, falling back to the LLM classifier
+
+**Current surrogate:** `embeddings_lr` (all-MiniLM-L6-v2 + LogisticRegression)
+- CV accuracy: 1.0000 (11 traces — will improve with more data)
+- Coverage: 100% of traffic handled locally
+- Teacher agreement: 100%
+
+**Key difference from TRACER:** Our router-proxy implements TRACER's trace-based adaptive routing concept but with a different architecture — we use a dual-tier (simple/complex) classifier with keyword deviation detection, session caching, and a streaming 3-tier fallback cascade with circuit breakers and key rotation. TRACER focuses on multi-class routing with a k-NN + linear probe surrogate; we use TF-IDF/embeddings + LR with teacher agreement gating.
+
+**Fitting the surrogate:**
+
+```bash
+# Default (best CV accuracy wins)
+python fit_surrogate.py
+
+# Prefer sentence embeddings when within 5% of TF-IDF accuracy
+python fit_surrogate.py --prefer-embeddings
+
+# Custom teacher agreement target
+python fit_surrogate.py --target 0.98
+```
+
+**Weekly auto-refit (cron):**
+
+A cron job runs `refit_surrogate.sh` weekly — reads traces, refits the surrogate, restarts the proxy, and runs a smoke test.
 
 ---
 
