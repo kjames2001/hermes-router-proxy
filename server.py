@@ -26,6 +26,26 @@ import time
 from pathlib import Path
 from typing import Any
 
+# ── Trace logging (structured JSONL for classifier decisions) ────────────
+try:
+    from trace import (
+        trace_cache_hit,
+        trace_circuit,
+        trace_classify,
+        trace_deviation,
+        trace_key_rotation,
+        trace_route,
+        trace_stream_error,
+    )
+except ImportError:  # pragma: no cover
+    trace_classify = lambda *a, **kw: None
+    trace_cache_hit = lambda *a, **kw: None
+    trace_deviation = lambda *a, **kw: None
+    trace_route = lambda *a, **kw: None
+    trace_circuit = lambda *a, **kw: None
+    trace_key_rotation = lambda *a, **kw: None
+    trace_stream_error = lambda *a, **kw: None
+
 import httpx
 import yaml
 from fastapi import FastAPI, HTTPException, Request
@@ -217,7 +237,7 @@ def _write_config_back(cfg: dict) -> None:
 
 # ── Classification ──────────────────────────────────────────────────────────
 
-def classify(cfg: dict, user_message: str) -> str:
+def classify(cfg: dict, user_message: str, *, session_key: str | None = None, is_first: bool = True) -> str:
     """
     Ask the flash classifier: "simple" or "complex"?
     Returns "simple" as safe default on any failure.
@@ -225,11 +245,25 @@ def classify(cfg: dict, user_message: str) -> str:
     t0 = time.time()
     prompt = build_classification_prompt(cfg, user_message)
     result = _call_classifier_raw(cfg, prompt, max_tokens=32)
-    _record_classifier_latency((time.time() - t0) * 1000)
+    latency_ms = (time.time() - t0) * 1000
+    _record_classifier_latency(latency_ms)
 
-    if "complex" in result:
-        return "complex"
-    return "simple"
+    tier = "complex" if "complex" in result else "simple"
+    model = cfg["models"][tier]["model"]
+
+    # ── Trace: classification decision ─────────────────────────────────
+    trace_classify(
+        session_key=session_key or "?",
+        user_message=user_message,
+        classifier_result=tier,
+        classifier_raw=result,
+        latency_ms=latency_ms,
+        tier=tier,
+        model=model,
+        is_first=is_first,
+    )
+
+    return tier
 
 
 # ── Keyword Deviation Detection ─────────────────────────────────────────────
@@ -284,13 +318,23 @@ def _levenshtein(s1: str, s2: str) -> int:
     return prev[-1]
 
 
-def has_deviation(cfg: dict, text: str, current_tier: str) -> bool:
+def has_deviation(cfg: dict, text: str, current_tier: str, *, session_key: str | None = None) -> bool:
     """Scan follow-up message for escalation/de-escalation keywords."""
     # Escalation: simple → suddenly complex
     if current_tier == "simple":
         for kw in cfg["routing"].get("escalation_keywords", []):
             if _fuzzy_match(kw, text):
                 log.info("Deviation: escalation keyword '%s' matched", kw)
+                new_tier = "complex"
+                model = cfg["models"][new_tier]["model"]
+                trace_deviation(
+                    session_key=session_key or "?",
+                    keyword=kw,
+                    direction="escalation",
+                    previous_tier=current_tier,
+                    new_tier=new_tier,
+                    model=model,
+                )
                 return True
 
     # De-escalation: complex → suddenly casual
@@ -298,6 +342,16 @@ def has_deviation(cfg: dict, text: str, current_tier: str) -> bool:
         for kw in cfg["routing"].get("de_escalation_keywords", []):
             if _fuzzy_match(kw, text):
                 log.info("Deviation: de-escalation keyword '%s' matched", kw)
+                new_tier = "simple"
+                model = cfg["models"][new_tier]["model"]
+                trace_deviation(
+                    session_key=session_key or "?",
+                    keyword=kw,
+                    direction="de_escalation",
+                    previous_tier=current_tier,
+                    new_tier=new_tier,
+                    model=model,
+                )
                 return True
 
     return False
@@ -357,6 +411,7 @@ def _circuit_is_open(cfg: dict, base_url: str) -> bool:
         log.info("Circuit %s → half-open (recovery timeout elapsed)", key)
         entry["state"] = "half_open"
         entry["half_open_at"] = time.time()
+        trace_circuit(base_url, "open", "half_open")
         return False
     remaining = cb_cfg.get("recovery_timeout_sec", 30) - int(time.time() - entry["opened_at"])
     if remaining > 0:
@@ -370,6 +425,9 @@ def _circuit_record_success(cfg: dict, base_url: str) -> None:
     entry = CIRCUITS.get(key)
     if entry and entry["state"] == "half_open":
         log.info("Circuit %s → closed (success in half-open)", key)
+        trace_circuit(base_url, "half_open", "closed")
+    elif entry and entry["state"] == "open":
+        trace_circuit(base_url, "open", "closed")
     CIRCUITS[key] = {"state": "closed", "failures": 0, "last_failure_at": 0}
 
 
@@ -393,6 +451,7 @@ def _circuit_record_failure(cfg: dict, base_url: str) -> None:
         )
         entry["state"] = "open"
         entry["opened_at"] = now
+        trace_circuit(base_url, "closed", "open", failures=entry["failures"])
     CIRCUITS[key] = entry
 
 
@@ -576,6 +635,11 @@ def call_model(
     # Key rotation: HTTP 429 with alternate key available -> retry
     if resp.status_code == 429 and alt_key:
         log.warning("Primary key rate-limited (429) - switching to alternate key")
+        trace_key_rotation(
+            base_url=base_url,
+            tier=model_cfg.get("tier", "unknown"),
+            reason="429_rate_limit",
+        )
         try:
             resp = httpx.post(
                 url,
@@ -662,23 +726,31 @@ async def route_request_stream(cfg: dict, payload: dict):
     tier: str
     if is_first_message(messages):
         user_content = _last_user_text(messages)
-        tier = classify(cfg, user_content)
+        tier = classify(cfg, user_content, session_key=key, is_first=True)
         cache_tier(key, tier)
     else:
         cached = get_cached_tier(cfg, key)
         if cached is None:
             user_content = _last_user_text(messages)
-            tier = classify(cfg, user_content)
+            tier = classify(cfg, user_content, session_key=key, is_first=False)
             cache_tier(key, tier)
         else:
             last_text = _last_user_text(messages)
-            if has_deviation(cfg, last_text, cached):
+            if has_deviation(cfg, last_text, cached, session_key=key):
                 user_content = _last_user_text(messages)
-                tier = classify(cfg, user_content)
+                tier = classify(cfg, user_content, session_key=key, is_first=False)
                 cache_tier(key, tier)
             else:
                 tier = cached
                 _inc_metric("cache_hits_total")
+                # ── Trace: cache hit ─────────────────────────────────
+                cache_entry = SESSIONS.get(key, {})
+                trace_cache_hit(
+                    session_key=key,
+                    tier=tier,
+                    model=cfg["models"][tier]["model"],
+                    age_sec=time.time() - cache_entry.get("at", time.time()),
+                )
 
     model_cfg = cfg["models"][tier]
     log.info("Streaming session %s → %s (%s)", key, tier, model_cfg["model"])
@@ -713,11 +785,19 @@ async def route_request_stream(cfg: dict, payload: dict):
                     err_body = await resp.aread()
                     err_text = err_body.decode(errors="replace")[:300]
                     log.warning("Streaming upstream returned %d: %s", resp.status_code, err_text[:150])
+                    trace_route(
+                        session_key=key, tier=tier, model=model_cfg["model"],
+                        upstream_status=resp.status_code, stream=True,
+                    )
                     yield f'data: {{"error":{{"message":"Upstream {resp.status_code}: {err_text}","type":"upstream_error"}}}}\n\n'.encode()
                     yield b'data: [DONE]\n\n'
                     return
 
                 log.info("Streaming %s OK", model_cfg["model"])
+                trace_route(
+                    session_key=key, tier=tier, model=model_cfg["model"],
+                    upstream_status=200, stream=True,
+                )
                 async for line in resp.aiter_lines():
                     if line:
                         yield f"{line}\n".encode()
@@ -730,6 +810,11 @@ async def route_request_stream(cfg: dict, payload: dict):
         except (httpx.RemoteProtocolError, httpx.ReadError, httpx.ConnectError) as exc:
             log.warning("Streaming %s transport error: %s", model_cfg["model"], exc)
             cnt = _record_failure(key)
+            trace_stream_error(
+                session_key=key, model=model_cfg["model"],
+                error=str(exc), failure_count=cnt,
+                max_failures=_RETRY_MAX_BEFORE_FALLBACK,
+            )
             log.info("Session %s failure %s/%s", key, cnt, _RETRY_MAX_BEFORE_FALLBACK)
             yield b'data: [DONE]\n\n'
 
@@ -751,7 +836,7 @@ def route_request(cfg: dict, payload: dict) -> JSONResponse:
         # Brand new session — classify via flash model only.
         # No keyword override — first messages are classifier territory.
         user_content = _last_user_text(messages)
-        tier = classify(cfg, user_content)
+        tier = classify(cfg, user_content, session_key=key, is_first=True)
         cache_tier(key, tier)
 
     else:
@@ -760,13 +845,13 @@ def route_request(cfg: dict, payload: dict) -> JSONResponse:
         if cached is None:
             # Expired — re-classify
             user_content = _last_user_text(messages)
-            tier = classify(cfg, user_content)
+            tier = classify(cfg, user_content, session_key=key, is_first=False)
             cache_tier(key, tier)
         else:
             last_text = _last_user_text(messages)
-            if has_deviation(cfg, last_text, cached):
+            if has_deviation(cfg, last_text, cached, session_key=key):
                 user_content = _last_user_text(messages)
-                tier = classify(cfg, user_content)
+                tier = classify(cfg, user_content, session_key=key, is_first=False)
                 if tier != cached:
                     log.info(
                         "Session %s tier changed: %s → %s", key, cached, tier
@@ -780,6 +865,14 @@ def route_request(cfg: dict, payload: dict) -> JSONResponse:
             else:
                 tier = cached
                 _inc_metric("cache_hits_total")
+                # ── Trace: cache hit ─────────────────────────────────────
+                cache_entry = SESSIONS.get(key, {})
+                trace_cache_hit(
+                    session_key=key,
+                    tier=tier,
+                    model=cfg["models"][tier]["model"],
+                    age_sec=time.time() - cache_entry.get("at", time.time()),
+                )
 
     # ── Call model ──────────────────────────────────────────────────────
     model_cfg = cfg["models"][tier]
@@ -790,6 +883,10 @@ def route_request(cfg: dict, payload: dict) -> JSONResponse:
     resp = call_model(cfg, model_cfg, payload)
 
     if resp.status_code == 200:
+        trace_route(
+            session_key=key, tier=tier, model=model_cfg["model"],
+            upstream_status=200, stream=False,
+        )
         return JSONResponse(content=resp.json())
 
     # ── Fallback ────────────────────────────────────────────────────────
@@ -805,6 +902,11 @@ def route_request(cfg: dict, payload: dict) -> JSONResponse:
     )
 
     _inc_metric("fallback_used_total")
+    trace_route(
+        session_key=key, tier=tier, model=model_cfg["model"],
+        upstream_status=resp.status_code, stream=False,
+        fallback_level=1, fallback_model=fallback_model,
+    )
     fb_cfg = {
         "model": fallback_model,
         "base_url": model_cfg["fallback_base_url"],
@@ -818,6 +920,10 @@ def route_request(cfg: dict, payload: dict) -> JSONResponse:
     if fb_resp.status_code == 200:
         data = fb_resp.json()
         data.setdefault("hermes_router", {})["fallback_used"] = True
+        trace_route(
+            session_key=key, tier=tier, model=fallback_model,
+            upstream_status=200, stream=False,
+        )
         return JSONResponse(content=data)
 
     # ── Fallback 2 ─────────────────────────────────────────────────────────
@@ -828,6 +934,11 @@ def route_request(cfg: dict, payload: dict) -> JSONResponse:
             fallback_model, fb_resp.status_code, fb2_model,
         )
         _inc_metric("fallback2_used_total")
+        trace_route(
+            session_key=key, tier=tier, model=fallback_model,
+            upstream_status=fb_resp.status_code, stream=False,
+            fallback_level=2, fallback_model=fb2_model,
+        )
         fb2_cfg = {
             "model": fb2_model,
             "base_url": model_cfg["fallback2_base_url"],
@@ -840,6 +951,10 @@ def route_request(cfg: dict, payload: dict) -> JSONResponse:
         if fb2_resp.status_code == 200:
             data = fb2_resp.json()
             data.setdefault("hermes_router", {})["fallback_used"] = True
+            trace_route(
+                session_key=key, tier=tier, model=fb2_model,
+                upstream_status=200, stream=False,
+            )
             return JSONResponse(content=data)
         return _proxy_error(fb2_resp)
 
