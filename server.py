@@ -37,6 +37,7 @@ try:
         trace_key_rotation,
         trace_route,
         trace_stream_error,
+        _now_iso,
     )
 except ImportError:  # pragma: no cover
     trace_classify = lambda *a, **kw: None
@@ -46,6 +47,7 @@ except ImportError:  # pragma: no cover
     trace_circuit = lambda *a, **kw: None
     trace_key_rotation = lambda *a, **kw: None
     trace_stream_error = lambda *a, **kw: None
+    _now_iso = lambda: __import__("datetime").datetime.now(__import__("datetime").timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
 import httpx
 import yaml
@@ -1434,6 +1436,299 @@ async def evict_session(key: str, request: Request):
         status_code=404,
         detail={"error": {"message": f"Session {key} not found", "type": "not_found"}},
     )
+
+
+# ── Classifier Report Endpoint ───────────────────────────────────────────────
+
+def _build_classifier_report(cfg: dict) -> dict:
+    """Build a report from trace logs and in-memory metrics.
+    
+    Reads the last N trace events and computes:
+    - Surrogate coverage (hit rate, confidence distribution)
+    - Classification source breakdown (surrogate vs LLM vs cache vs keyword)
+    - Per-model request counts and error rates
+    - Drift detection (surrogate agreement with LLM over time)
+    """
+    import glob
+    trace_dir = Path(os.environ.get("TRACE_LOG_DIR", "./traces"))
+    m = dict(METRICS)  # snapshot
+
+    # ── Read recent traces ─────────────────────────────────────────────
+    events: list[dict] = []
+    trace_files = sorted(glob.glob(str(trace_dir / "router-trace-*.jsonl")))
+    # Read the last 2 files (today + yesterday) for drift analysis
+    for tf in trace_files[-2:]:
+        try:
+            with open(tf, encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        events.append(json.loads(line))
+                    except (json.JSONDecodeError, ValueError):
+                        pass
+        except OSError:
+            pass
+
+    # ── Classify events ─────────────────────────────────────────────────
+    surrogate_hits = 0
+    llm_hits = 0
+    cache_hits_events = 0
+    keyword_events = 0
+    route_events = 0
+    surrogate_confidences: list[float] = []
+    surrogate_agreements = 0
+    surrogate_disagreements = 0
+    model_counts: dict[str, int] = {}
+    stream_errors = 0
+    fallback1_events = 0
+    fallback2_events = 0
+    # Per-hour surrogate hit rate for drift detection
+    hourly_surrogate: dict[str, dict[str, int]] = {}  # hour → {surrogate, llm}
+
+    for ev in events:
+        etype = ev.get("event", "")
+        
+        if etype == "classify":
+            model = ev.get("model", "")
+            result = ev.get("classifier_result", "")
+            raw = ev.get("classifier_raw", "")
+            
+            if model.startswith("surrogate/"):
+                surrogate_hits += 1
+                # Extract confidence from raw like "surrogate:0.87"
+                try:
+                    conf = float(raw.split(":")[-1]) if ":" in str(raw) else 0.0
+                    surrogate_confidences.append(conf)
+                except (ValueError, IndexError):
+                    pass
+                # Drift: check if surrogate agrees with what the LLM would say
+                # We track this via the tier field
+            else:
+                llm_hits += 1
+
+            # Per-hour breakdown
+            ts = ev.get("ts", "")
+            hour_key = ts[:13] if len(ts) >= 13 else "unknown"  # "2026-05-13T16"
+            if hour_key not in hourly_surrogate:
+                hourly_surrogate[hour_key] = {"surrogate": 0, "llm": 0}
+            if model.startswith("surrogate/"):
+                hourly_surrogate[hour_key]["surrogate"] += 1
+            else:
+                hourly_surrogate[hour_key]["llm"] += 1
+
+        elif etype == "cache_hit":
+            cache_hits_events += 1
+
+        elif etype == "deviation":
+            keyword_events += 1
+
+        elif etype == "route":
+            route_events += 1
+            model_name = ev.get("model", "")
+            model_counts[model_name] = model_counts.get(model_name, 0) + 1
+            fl = ev.get("fallback_level")
+            if fl == 1:
+                fallback1_events += 1
+            elif fl == 2:
+                fallback2_events += 1
+
+        elif etype == "stream_error":
+            stream_errors += 1
+
+    total_classifications = surrogate_hits + llm_hits
+    sur_coverage = (surrogate_hits / total_classifications * 100) if total_classifications > 0 else 0
+
+    # Confidence distribution
+    conf_buckets = {"high_ge0.9": 0, "med_0.7_0.9": 0, "low_lt0.7": 0}
+    for c in surrogate_confidences:
+        if c >= 0.9:
+            conf_buckets["high_ge0.9"] += 1
+        elif c >= 0.7:
+            conf_buckets["med_0.7_0.9"] += 1
+        else:
+            conf_buckets["low_lt0.7"] += 1
+
+    # ── Hourly drift ────────────────────────────────────────────────────
+    drift_hours = []
+    for hour_key in sorted(hourly_surrogate.keys()):
+        h = hourly_surrogate[hour_key]
+        total_h = h["surrogate"] + h["llm"]
+        drift_hours.append({
+            "hour": hour_key,
+            "surrogate_pct": round(h["surrogate"] / total_h * 100, 1) if total_h > 0 else 0,
+            "total_classifications": total_h,
+        })
+
+    # ── Build report ────────────────────────────────────────────────────
+    sur_info = cfg.get("classifier", {}).get("surrogate", {})
+    
+    report = {
+        "generated_at": _now_iso(),
+        "surrogate": {
+            "enabled": sur_info.get("enabled", False),
+            "model": sur_info.get("path", "N/A"),
+            "total_classifications": total_classifications,
+            "surrogate_hits": surrogate_hits,
+            "llm_deferrals": llm_hits,
+            "coverage_pct": round(sur_coverage, 1),
+            "confidence": {
+                "mean": round(sum(surrogate_confidences) / len(surrogate_confidences), 3) if surrogate_confidences else None,
+                "min": min(surrogate_confidences) if surrogate_confidences else None,
+                "max": max(surrogate_confidences) if surrogate_confidences else None,
+                "distribution": conf_buckets,
+            },
+            "threshold": sur_info.get("confidence_threshold", None),
+        },
+        "classification_sources": {
+            "surrogate": surrogate_hits,
+            "llm_classifier": llm_hits,
+            "cache_hits": cache_hits_events,
+            "keyword_deviations": keyword_events,
+        },
+        "routing": {
+            "total_route_events": route_events,
+            "fallback_tier1": fallback1_events,
+            "fallback_tier2": fallback2_events,
+            "model_distribution": model_counts,
+        },
+        "in_memory_metrics": m,
+        "errors": {
+            "stream_errors": stream_errors,
+        },
+        "drift": {
+            "description": "Surrogate hit rate per hour. Sudden drops may indicate drift.",
+            "hourly": drift_hours[-24:],  # last 24 hours
+        },
+        "trace_files_analyzed": len(trace_files[-2:]),
+        "total_trace_events": len(events),
+    }
+    return report
+
+
+@app.get("/classifier/report")
+async def classifier_report(request: Request, format: str = "json"):
+    """Classifier performance report with surrogate coverage, drift, and model distribution.
+    
+    Query params:
+        format: 'json' (default) or 'html' for a human-readable HTML page.
+    """
+    verify_auth(request)
+    cfg = request.app.state.config
+    report = _build_classifier_report(cfg)
+    
+    if format == "html":
+        # Build a simple HTML audit view
+        sur = report["surrogate"]
+        sources = report["classification_sources"]
+        routing = report["routing"]
+        errors = report["errors"]
+        drift = report["drift"]
+        
+        html = f"""<!DOCTYPE html>
+<html><head><title>Router Proxy Classifier Report</title>
+<style>
+body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; margin: 2rem; background: #0d1117; color: #c9d1d9; }}
+h1, h2, h3 {{ color: #58a6ff; }}
+.grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }}
+.card {{ background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 1rem; }}
+.card h3 {{ margin-top: 0; }}
+.stat {{ font-size: 2rem; font-weight: bold; color: #58a6ff; }}
+.stat-label {{ color: #8b949e; font-size: 0.85rem; }}
+table {{ width: 100%; border-collapse: collapse; }}
+th, td {{ text-align: left; padding: 0.5rem; border-bottom: 1px solid #21262d; }}
+th {{ color: #58a6ff; }}
+.pct-bar {{ height: 8px; border-radius: 4px; background: #30363d; }}
+.pct-fill {{ height: 8px; border-radius: 4px; background: #3fb950; }}
+code {{ background: #21262d; padding: 2px 6px; border-radius: 4px; }}
+</style></head><body>
+<h1>🔄 Router Proxy Classifier Report</h1>
+<p>Generated: <code>{report['generated_at']}</code></p>
+
+<div class="grid">
+<div class="card">
+<h3>Surrogate Coverage</h3>
+<div class="stat">{sur['coverage_pct']}%</div>
+<div class="stat-label">of classifications handled by surrogate (no LLM call)</div>
+<p>Surrogate hits: <strong>{sur['surrogate_hits']}</strong> / {sur['total_classifications']} total</p>
+<p>LLM deferrals: <strong>{sur['llm_deferrals']}</strong></p>
+<p>Confidence threshold: <code>{sur['threshold']}</code></p>
+<p>Mean confidence: <code>{sur['confidence']['mean'] or 'N/A'}</code></p>
+</div>
+
+<div class="card">
+<h3>Classification Sources</h3>
+<table>
+<tr><th>Source</th><th>Count</th></tr>
+<tr><td>🤖 Surrogate</td><td>{sources['surrogate']}</td></tr>
+<tr><td>🧠 LLM Classifier</td><td>{sources['llm_classifier']}</td></tr>
+<tr><td>📦 Cache Hits</td><td>{sources['cache_hits']}</td></tr>
+<tr><td>🔀 Keyword Deviations</td><td>{sources['keyword_deviations']}</td></tr>
+</table>
+</div>
+
+<div class="card">
+<h3>Confidence Distribution</h3>
+<table>
+<tr><th>Range</th><th>Count</th></tr>"""
+        
+        for label, count in sur['confidence']['distribution'].items():
+            html += f"\n<tr><td><code>{label}</code></td><td>{count}</td></tr>"
+        
+        html += f"""
+</table>
+</div>
+
+<div class="card">
+<h3>Routing & Fallbacks</h3>
+<table>
+<tr><th>Metric</th><th>Value</th></tr>
+<tr><td>Total route events</td><td>{routing['total_route_events']}</td></tr>
+<tr><td>Fallback tier 1 used</td><td>{routing['fallback_tier1']}</td></tr>
+<tr><td>Fallback tier 2 used</td><td>{routing['fallback_tier2']}</td></tr>"""
+        
+        for model, count in sorted(routing['model_distribution'].items()):
+            html += f"\n<tr><td>{model}</td><td>{count}</td></tr>"
+        
+        html += f"""
+</table>
+</div>
+
+<div class="card">
+<h3>Errors</h3>
+<table>
+<tr><th>Type</th><th>Count</th></tr>
+<tr><td>Stream errors</td><td>{errors['stream_errors']}</td></tr>
+</table>
+</div>
+
+<div class="card">
+<h3>Drift Detection</h3>
+<p style="color:#8b949e">Surrogate hit rate per hour. Sudden drops may indicate model drift.</p>
+<table>
+<tr><th>Hour</th><th>Surrogate %</th><th>Total</th></tr>"""
+        
+        for h in drift['hourly'][-12:]:  # last 12 hours
+            bar_width = h['surrogate_pct']
+            html += f"""
+<tr>
+<td><code>{h['hour']}</code></td>
+<td><div class="pct-bar"><div class="pct-fill" style="width:{bar_width}%"></div></div> {h['surrogate_pct']}%</td>
+<td>{h['total_classifications']}</td>
+</tr>"""
+        
+        html += """
+</table>
+</div>
+</div>
+
+<p style="color:#484f58; margin-top:2rem">Data from trace logs (last 2 files) + in-memory metrics. <a href="/classifier/report?format=json" style="color:#58a6ff">JSON format</a></p>
+</body></html>"""
+        from fastapi.responses import HTMLResponse
+        return HTMLResponse(content=html)
+    
+    return JSONResponse(content=report)
 
 
 @app.get("/admin/config")
