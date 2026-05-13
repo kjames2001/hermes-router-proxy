@@ -55,6 +55,9 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 
+# Shared model classes — needed so joblib can deserialize embedding-based pipelines
+from surrogate_models import SentenceTransformerVectorizer  # noqa: F401
+
 # ── Logging ─────────────────────────────────────────────────────────────────
 class JsonFormatter(logging.Formatter):
     """Structured JSON log formatter — one line per record."""

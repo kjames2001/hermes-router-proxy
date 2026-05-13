@@ -48,58 +48,8 @@ try:
 except ImportError:
     import pickle as joblib  # fallback
 
-# ── Sentence Transformers (optional — graceful fallback) ──────────────
-HAS_SENTENCE_TRANSFORMERS = False
-try:
-    from sentence_transformers import SentenceTransformer
-    HAS_SENTENCE_TRANSFORMERS = True
-except ImportError:
-    pass
-
-
-# ── Custom Wrapper: Sentence Transformer as sklearn Transformer ────────
-class SentenceTransformerVectorizer(BaseEstimator, TransformerMixin):
-    """Wrap a SentenceTransformer model as an sklearn Transformer for Pipeline use.
-
-    Caches embeddings so repeated calls don't recompute.
-    """
-
-    def __init__(self, model_name: str = "all-MiniLM-L6-v2", batch_size: int = 64):
-        self.model_name = model_name
-        self.batch_size = batch_size
-        self._model = None
-        self._cache: dict[str, np.ndarray] = {}
-
-    def _load_model(self):
-        if self._model is None:
-            t0 = time.time()
-            self._model = SentenceTransformer(self.model_name, device="cpu")
-            print(f"    Loaded {self.model_name} in {time.time() - t0:.1f}s")
-
-    def fit(self, X, y=None):
-        self._load_model()
-        return self
-
-    def transform(self, X):
-        self._load_model()
-        if isinstance(X, (list, np.ndarray)):
-            texts = list(X)
-        else:
-            texts = X.tolist() if hasattr(X, 'tolist') else list(X)
-
-        # Check cache
-        uncached = [t for t in texts if t not in self._cache]
-        if uncached:
-            embeddings = self._model.encode(
-                uncached,
-                batch_size=self.batch_size,
-                show_progress_bar=False,
-                normalize_embeddings=True,
-            )
-            for t, emb in zip(uncached, embeddings):
-                self._cache[t] = emb
-
-        return np.array([self._cache[t] for t in texts])
+# Shared model classes (used for joblib deserialization path consistency)
+from surrogate_models import SentenceTransformerVectorizer, HAS_SENTENCE_TRANSFORMERS
 
 
 # ── Trace Loading ──────────────────────────────────────────────────────
@@ -205,6 +155,7 @@ def fit_candidates(
     labels: list[str],
     target_agreement: float = 0.95,
     teacher_model: str = "unknown",
+    prefer_embeddings: bool = False,
 ) -> dict:
     """
     Fit candidate surrogates (TF-IDF + embedding-based) and evaluate against teacher labels.
@@ -342,6 +293,23 @@ def fit_candidates(
         print("  ERROR: No candidate model succeeded.")
         sys.exit(1)
 
+    # If prefer_embeddings and best is TF-IDF, check if an embedding candidate is within 5%
+    if prefer_embeddings and not best_name.startswith("embeddings_"):
+        emb_candidates = [r for r in results if r["name"].startswith("embeddings_")]
+        if emb_candidates:
+            best_emb = max(emb_candidates, key=lambda r: r["cv_mean"])
+            if best_emb["cv_mean"] >= best_score - 0.05:
+                # Swap to embedding candidate
+                for name, pipeline in candidates:
+                    if name == best_emb["name"]:
+                        best_name = name
+                        best_score = best_emb["cv_mean"]
+                        best_pipeline = pipeline
+                        best_report = classification_report(y, pipeline.predict(X), zero_division=0)
+                        print(f"  Prefer-embeddings: using {best_name} (CV={best_score:.4f}) "
+                              f"over best TF-IDF (CV={results[0]['cv_mean']:.4f})")
+                        break
+
     # Build acceptor gate — calibrated classifier for per-input confidence
     print(f"\n  Best candidate: {best_name} (CV accuracy: {best_score:.4f})")
 
@@ -447,6 +415,10 @@ def main():
         "--output", type=Path, default=None,
         help="Output directory (default: .router/surrogate/)",
     )
+    parser.add_argument(
+        "--prefer-embeddings", action="store_true", default=False,
+        help="Prefer embedding-based model over TF-IDF if within 5% CV accuracy",
+    )
     args = parser.parse_args()
 
     script_dir = Path(__file__).resolve().parent
@@ -486,6 +458,7 @@ def main():
         texts, labels,
         target_agreement=args.target,
         teacher_model=teacher_model,
+        prefer_embeddings=args.prefer_embeddings,
     )
 
     # Cost projection

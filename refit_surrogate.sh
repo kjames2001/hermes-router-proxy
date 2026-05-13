@@ -35,7 +35,7 @@ fi
 
 # Step 2: Run fit_surrogate.py
 echo "  Running fit_surrogate.py..."
-if ! "$VENV_PY" fit_surrogate.py; then
+if ! "$VENV_PY" fit_surrogate.py --prefer-embeddings; then
     echo "  ✗ fit_surrogate.py failed!" >&2
     exit 2
 fi
