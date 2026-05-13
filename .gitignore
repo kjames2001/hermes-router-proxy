@@ -15,3 +15,9 @@ __pycache__/
 # OS
 .DS_Store
 Thumbs.db
+
+# Classification traces (contain user messages)
+.router/
+
+# JSONL trace logs (contain user message previews)
+traces/
