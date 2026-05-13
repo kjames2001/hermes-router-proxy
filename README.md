@@ -39,6 +39,7 @@ The router-proxy acts as a **transparent SSE proxy** — no internal retry loops
 
 - **Prometheus-compatible metrics** — `GET /metrics` with counters for requests by tier, classifier calls/latency, cache hits, 429s by tier, fallback usage, streaming requests, errors, active sessions, open circuits
 - **JSON structured logging** — `LOG_FORMAT=json` env var enables one-line JSON logs for both router and uvicorn
+- **Structured JSONL trace logging** — Every routing decision (classify, cache hit, deviation, fallback, circuit breaker, key rotation) is emitted as a JSON line to a date-stamped trace file. Enables full audit trail and post-hoc analysis of classifier behavior. See [Trace Logging](#trace-logging) below.
 - **Admin API** — `POST /reload` (hot-reload config without restart), `GET/DELETE /admin/sessions` (inspect/evict cached sessions), `GET /admin/config` (inspect live config), `GET /circuits` + `POST /circuits/reset` (circuit breaker management)
 
 ### Security & Compatibility
@@ -219,6 +220,10 @@ persona:
 | `ROUTER_PROXY_API_KEY` | Auth for admin/metrics/circuit endpoints | none (open) |
 | `LOG_FORMAT` | Set to `json` for structured JSON logging | plain text |
 | `CORS_ORIGINS` | Comma-separated allowed origins | `*` |
+| `TRACE_LOG_DIR` | Directory for JSONL trace files | `./traces` |
+| `TRACE_LOG_MAX_BYTES` | Max bytes per trace file before rotation | `10485760` (10 MB) |
+| `TRACE_LOG_BACKUPS` | Number of rotated trace files to keep | `5` |
+| `TRACE_LOG_ENABLED` | Set to `false` or `0` to disable trace logging | `true` |
 
 ---
 
@@ -369,6 +374,61 @@ hermes_router_fallback_used_total{level="1"} 12
 hermes_router_fallback_used_total{level="2"} 2
 hermes_router_circuits_open 1
 hermes_router_sessions_active 8
+```
+
+### Trace Logging (JSONL)
+
+Every routing decision is emitted as a structured JSON line to a rotating trace log. This provides a full audit trail for debugging classifier accuracy, analyzing routing patterns, and post-hoc investigation.
+
+**Configuration (environment variables):**
+
+| Variable | Purpose | Default |
+|---|---|---|
+| `TRACE_LOG_DIR` | Directory for trace files | `./traces` |
+| `TRACE_LOG_MAX_BYTES` | Max bytes per file before rotation | `10485760` (10 MB) |
+| `TRACE_LOG_BACKUPS` | Number of rotated files to keep | `5` |
+| `TRACE_LOG_ENABLED` | Set to `false` or `0` to disable | `true` |
+
+**Trace file format:**
+
+Files are named `router-trace-YYYYMMDD.jsonl` (one per day) and each line is a JSON object:
+
+```json
+{"ts":"2026-05-13T09:15:23.456Z","event":"classify","session_key":"a1b2c3","classifier_result":"complex","latency_ms":210.5,"tier":"complex","model":"deepseek-v4-pro","is_first":true}
+{"ts":"2026-05-13T09:15:24.100Z","event":"cache_hit","session_key":"a1b2c3","tier":"simple","model":"deepseek-v4-flash","age_sec":45.2}
+{"ts":"2026-05-13T09:15:25.200Z","event":"deviation","session_key":"d4e5f6","keyword":"debug","direction":"escalation","previous_tier":"simple","new_tier":"complex","model":"deepseek-v4-pro"}
+{"ts":"2026-05-13T09:15:26.300Z","event":"route","session_key":"a1b2c3","tier":"complex","model":"deepseek-v4-pro","upstream_status":200,"stream":true}
+{"ts":"2026-05-13T09:15:27.400Z","event":"circuit","base_url":"https://api.example.com/v1","old_state":"closed","new_state":"open","failures":3}
+{"ts":"2026-05-13T09:15:28.500Z","event":"key_rotation","base_url":"https://api.example.com/v1","tier":"complex","reason":"429_rate_limit"}
+{"ts":"2026-05-13T09:15:29.600Z","event":"stream_error","session_key":"a1b2c3","model":"deepseek-v4-pro","error":"RemoteProtocolError: Connection lost","failure_count":2,"max_failures":3}
+```
+
+**Event types:**
+
+| Event | When emitted | Key fields |
+|---|---|---|
+| `classify` | Flash model classifies a prompt | `session_key`, `classifier_result`, `latency_ms`, `tier`, `model`, `is_first` |
+| `cache_hit` | Reused cached tier for follow-up | `session_key`, `tier`, `model`, `age_sec` |
+| `deviation` | Keyword match changes tier mid-session | `keyword`, `direction` (escalation/de_escalation), `previous_tier`, `new_tier` |
+| `route` | Request forwarded to upstream model | `session_key`, `tier`, `model`, `upstream_status`, `stream`, `fallback_level`, `fallback_model` |
+| `circuit` | Circuit breaker state change | `base_url`, `old_state`, `new_state`, `failures` |
+| `key_rotation` | API key rotated on 429 | `base_url`, `tier`, `reason` |
+| `stream_error` | Streaming transport failure | `session_key`, `model`, `error`, `failure_count`, `max_failures` |
+
+**Querying traces:**
+
+```bash
+# All classification decisions for a session
+cat traces/router-trace-20260513.jsonl | jq 'select(.event=="classify")' | less
+
+# Sessions that escalated from simple to complex
+cat traces/router-trace-*.jsonl | jq 'select(.event=="deviation" and .direction=="escalation")'
+
+# Average classifier latency (ms)
+cat traces/router-trace-*.jsonl | jq 'select(.event=="classify") .latency_ms' | awk '{sum+=$1; count++} END{print sum/count}'
+
+# Circuit breaker trips
+cat traces/router-trace-*.jsonl | jq 'select(.event=="circuit" and .new_state=="open")'
 ```
 
 ---
