@@ -30,7 +30,6 @@ import glob
 import sys
 import time
 from pathlib import Path
-from typing import Any
 
 import numpy as np
 
@@ -39,9 +38,8 @@ from sklearn.calibration import CalibratedClassifierCV
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import LogisticRegression, SGDClassifier
 from sklearn.metrics import accuracy_score, classification_report
-from sklearn.model_selection import cross_val_score, StratifiedKFold
-from sklearn.pipeline import Pipeline, FeatureUnion
-from sklearn.base import BaseEstimator, TransformerMixin
+from sklearn.model_selection import cross_val_score
+from sklearn.pipeline import Pipeline
 
 try:
     import joblib
@@ -109,8 +107,6 @@ def extract_classifier_traces(events: list[dict]) -> list[dict]:
     """
     results = []
     for ev in events:
-        etype = ev.get("event", "") or ev.get("source", "")
-
         # New format: event == "classify"
         if ev.get("event") == "classify":
             text = ev.get("user_message_preview", "").strip()
@@ -241,8 +237,6 @@ def fit_candidates(
         print("  sentence-transformers not installed — skipping embedding candidates.")
 
     actual_splits = max(2, min(5, len(texts) // 4))
-    skf = StratifiedKFold(n_splits=actual_splits, shuffle=True, random_state=42)
-
     best_name = None
     best_pipeline = None
     best_score = 0.0
@@ -379,7 +373,7 @@ def fit_candidates(
     joblib.dump(acceptor, output_dir / "acceptor.joblib")
 
     print(f"\n  {'='*60}")
-    print(f"  Surrogate Fitting Results")
+    print("  Surrogate Fitting Results")
     print(f"  {'='*60}")
     print(f"  Teacher model:      {manifest['teacher_model']}")
     print(f"  Surrogate method:   {best_name}")
@@ -391,12 +385,12 @@ def fit_candidates(
     print(f"  Acceptor threshold: {threshold_at_target:.4f} (at {target_agreement} agreement)")
     print(f"  Thresholds:         {thresholds}")
     print(f"  {'='*60}")
-    print(f"\n  Classification report (full training set):")
+    print("\n  Classification report (full training set):")
     print(best_report)
     print(f"\n  Saved to: {output_dir}/")
-    print(f"    manifest.json  — metadata and metrics")
-    print(f"    pipeline.joblib — surrogate model")
-    print(f"    acceptor.joblib — calibrated acceptor gate")
+    print("    manifest.json  — metadata and metrics")
+    print("    pipeline.joblib — surrogate model")
+    print("    acceptor.joblib — calibrated acceptor gate")
 
     return manifest
 
@@ -422,15 +416,14 @@ def main():
     args = parser.parse_args()
 
     script_dir = Path(__file__).resolve().parent
-    output_dir = args.output or script_dir / ".router" / "surrogate"
 
-    print(f"\n  TRACER Surrogate Fitting")
-    print(f"  Trace sources: traces/router-trace-*.jsonl + .router/traces.jsonl")
+    print("\n  TRACER Surrogate Fitting")
+    print("  Trace sources: traces/router-trace-*.jsonl + .router/traces.jsonl")
     print(f"  Target teacher agreement: {args.target}")
     if HAS_SENTENCE_TRANSFORMERS:
-        print(f"  Sentence transformers: AVAILABLE (all-MiniLM-L6-v2)")
+        print("  Sentence transformers: AVAILABLE (all-MiniLM-L6-v2)")
     else:
-        print(f"  Sentence transformers: NOT AVAILABLE (pip install sentence-transformers)")
+        print("  Sentence transformers: NOT AVAILABLE (pip install sentence-transformers)")
 
     events = load_traces_all(script_dir)
     print(f"  Loaded {len(events)} raw trace events")
@@ -465,8 +458,8 @@ def main():
     if manifest["n_traces"] > 0:
         coverage = manifest["coverage"]
         teacher_agreement = manifest["accepted_agreement"]
-        print(f"\n  Cost Projection (10k queries/day):")
-        print(f"    Without surrogate: 10,000 LLM classifier calls/day")
+        print("\n  Cost Projection (10k queries/day):")
+        print("    Without surrogate: 10,000 LLM classifier calls/day")
         print(f"    With surrogate:     {int(10000 * (1 - coverage))} LLM calls/day "
               f"({coverage:.0%} handled locally)")
         print(f"    Teacher agreement on handled traffic: {teacher_agreement:.1%}")
