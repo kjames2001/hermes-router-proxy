@@ -7,7 +7,7 @@ queries (coding, system administration) to capable models. Session-aware:
 classifies once with a flash model, then uses sub-millisecond keyword
 deviation detection for follow-up messages.
 
-OpenAI-compatible at POST /v1/chat/completitions.
+OpenAI-compatible at POST /v1/chat/completions.
 Configuration: router_config.yaml (auto-detected alongside this file).
 
 Author: James Huang + Jarvis (Hermes Agent)
@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import hashlib
+import hmac
 import json
 import logging
 import os
@@ -110,12 +111,30 @@ CONFIG_PATH = CONFIG_DIR / "router_config.yaml"
 
 
 def load_config() -> dict[str, Any]:
-    """Load router_config.yaml, fail loudly if missing."""
+    """Load router_config.yaml, fail loudly if missing.
+
+    Supports both legacy (models: simple/complex) and new (categories: N)
+    config formats. Legacy is auto-migrated to categories on load.
+    """
     if not CONFIG_PATH.exists():
         log.fatal("Config not found: %s — run install.sh first", CONFIG_PATH)
         sys.exit(1)
     with open(CONFIG_PATH) as f:
-        return yaml.safe_load(f)
+        cfg = yaml.safe_load(f)
+
+    # Migrate legacy format: models: {simple, complex} → categories: {chat, code}
+    if "categories" not in cfg and "models" in cfg:
+        old = cfg.pop("models")
+        cfg["categories"] = {}
+        if "simple" in old:
+            cfg["categories"]["chat"] = old["simple"]
+            cfg["categories"]["chat"]["label"] = "Chat & Trivia"
+        if "complex" in old:
+            cfg["categories"]["code"] = old["complex"]
+            cfg["categories"]["code"]["label"] = "Code & Debug"
+        log.info("Migrated legacy models config to categories format")
+
+    return cfg
 
 
 def env_key(name: str) -> str:
@@ -125,11 +144,26 @@ def env_key(name: str) -> str:
 
 # ── Profile Hint (lazy extraction) ──────────────────────────────────────────
 
+def _category_list(cfg: dict) -> str:
+    """Build the category description string for the classifier prompt."""
+    cats = cfg.get("categories", {})
+    lines = []
+    for name, c in cats.items():
+        label = c.get("label", name)
+        lines.append(f"  {name} — {label}")
+    return "\n".join(lines)
+
+
+def _category_names(cfg: dict) -> list[str]:
+    """Return list of valid category names."""
+    return list(cfg.get("categories", {}).keys())
+
+
 def build_classification_prompt(
     cfg: dict, user_message: str, *, force_extract: bool = False
 ) -> str:
     """
-    Return the full classification prompt with profile hint injected.
+    Return the full classification prompt with profile hint and categories injected.
     On first call (profile_hint empty) or when force_extract=True,
     reads USER.md + MEMORY.md and caches a 2-3 sentence summary back to config.
     """
@@ -141,7 +175,10 @@ def build_classification_prompt(
         _write_config_back(cfg)
 
     template = cfg["classifier"]["system_prompt"]
-    prompt = template.strip().replace("{message}", user_message)
+    cats_str = _category_list(cfg)
+    prompt = template.strip()
+    prompt = prompt.replace("{categories}", cats_str)
+    prompt = prompt.replace("{message}", user_message)
     if hint:
         prompt = f"Agent context: {hint}\n\n{prompt}"
     return prompt
@@ -236,10 +273,21 @@ def _call_classifier_raw(
 
 
 def _write_config_back(cfg: dict) -> None:
-    """Write updated config back to disk (profile_hint after extraction)."""
+    """Write updated config back to disk (profile_hint after extraction).
+
+    Creates a backup before writing to preserve the original (including any
+    YAML comments that yaml.dump would destroy). The backup is saved with
+    a .bak suffix.
+    """
+    import shutil
+    backup_path = CONFIG_PATH.with_suffix(".yaml.bak")
+    try:
+        shutil.copy2(CONFIG_PATH, backup_path)
+    except Exception:
+        log.warning("Could not create config backup at %s — proceeding anyway", backup_path)
     with open(CONFIG_PATH, "w") as f:
         yaml.dump(cfg, f, default_flow_style=False, sort_keys=False)
-    log.info("Wrote updated router_config.yaml with profile_hint")
+    log.info("Wrote updated router_config.yaml with profile_hint (backup at %s)", backup_path)
 
 
 # ── Surrogate Classifier (TRACER-inspired acceptor gate) ────────────────────
@@ -360,9 +408,82 @@ def _get_surrogate(cfg: dict) -> SurrogateClassifier | None:
 
 # ── Classification ──────────────────────────────────────────────────────────
 
+def _parse_category(result: str, cfg: dict) -> str:
+    """Parse the classifier LLM output into a valid category name.
+
+    Handles: exact match, word match, substring match.
+    Falls back to the first category if no match.
+    """
+    result = result.strip().lower().strip('"\'\'.,;:!?()[]{}')
+    names = _category_names(cfg)
+
+    # Exact match
+    if result in names:
+        return result
+
+    # Word-level match (classifier may add extra words)
+    words = result.split()
+    for name in names:
+        if name in words:
+            return name
+
+    # Substring match
+    for name in names:
+        if name in result:
+            return name
+
+    # Fallback to first category
+    if names:
+        log.warning("Classifier returned unknown category '%s' — defaulting to '%s'", result, names[0])
+        return names[0]
+    return "chat"
+
+
+def _detect_override(text: str, cfg: dict) -> str | None:
+    """Check if the user message contains a /use:<category> override.
+
+    Returns the category name if found, None otherwise.
+    Also returns the cleaned message (without the override prefix).
+    """
+    prefix = cfg.get("routing", {}).get("override_prefix", "/use:")
+    names = _category_names(cfg)
+
+    # Match /use:category at the start of the message
+    text_stripped = text.strip()
+    if not text_stripped.startswith(prefix):
+        return None
+
+    # Extract everything after the prefix until whitespace
+    rest = text_stripped[len(prefix):]
+    # The category name is the first word
+    parts = rest.split(None, 1)
+    if not parts:
+        return None
+
+    cat = parts[0].strip().lower()
+    if cat in names:
+        return cat
+
+    log.warning("Override '/use:%s' not a valid category — valid: %s", cat, names)
+    return None
+
+
+def _strip_override(text: str, cfg: dict) -> str:
+    """Remove the /use: prefix from the message, returning the clean text."""
+    prefix = cfg.get("routing", {}).get("override_prefix", "/use:")
+    text_stripped = text.strip()
+    if text_stripped.startswith(prefix):
+        rest = text_stripped[len(prefix):]
+        parts = rest.split(None, 1)
+        if len(parts) > 1:
+            return parts[1].strip()
+        return ""
+    return text
+
+
 def classify(cfg: dict, user_message: str, *, session_key: str | None = None, is_first: bool = True) -> str:
     """
-    Classify a user message as "simple" or "complex".
+    Classify a user message into one of the configured categories.
 
     Uses the TRACER-inspired acceptor gate:
       1. Try ML surrogate first (fast, free, ~0.1ms)
@@ -370,15 +491,17 @@ def classify(cfg: dict, user_message: str, *, session_key: str | None = None, is
       3. If surrogate confidence < threshold → fall back to LLM classifier
 
     Falls back to LLM classifier entirely if no surrogate is loaded.
-    Returns "simple" as safe default on any failure.
+    Returns the first category as safe default on any failure.
     """
+    names = _category_names(cfg)
+
     surrogate = _get_surrogate(cfg)
 
     if surrogate is not None:
         label, confidence = surrogate.predict(user_message)
-        if confidence >= surrogate.confidence_threshold:
-            # Surrogate is confident — skip LLM classifier entirely
-            latency_ms = 0.1  # ~sub-ms inference
+        # Verify surrogate label is a valid category
+        if confidence >= surrogate.confidence_threshold and label in names:
+            latency_ms = 0.1
             _record_classifier_latency(latency_ms)
 
             log.info(
@@ -386,7 +509,6 @@ def classify(cfg: dict, user_message: str, *, session_key: str | None = None, is
                 user_message[:60], label, confidence, surrogate.confidence_threshold,
             )
 
-            # Trace: surrogate decision (fast path)
             trace_classify(
                 session_key=session_key or "?",
                 user_message=user_message,
@@ -400,7 +522,6 @@ def classify(cfg: dict, user_message: str, *, session_key: str | None = None, is
 
             return label
         else:
-            # Surrogate uncertain — fall through to LLM
             log.info(
                 "Surrogate uncertain: '%s' (%.2f < %.2f threshold) — deferring to LLM",
                 user_message[:60], confidence, surrogate.confidence_threshold,
@@ -413,22 +534,21 @@ def classify(cfg: dict, user_message: str, *, session_key: str | None = None, is
     latency_ms = (time.time() - t0) * 1000
     _record_classifier_latency(latency_ms)
 
-    tier = "complex" if "complex" in result else "simple"
-    model = cfg["models"][tier]["model"]
+    category = _parse_category(result, cfg)
+    model = cfg["categories"][category]["model"]
 
-    # ── Trace: LLM classification decision ─────────────────────────────
     trace_classify(
         session_key=session_key or "?",
         user_message=user_message,
-        classifier_result=tier,
+        classifier_result=category,
         classifier_raw=result,
         latency_ms=latency_ms,
-        tier=tier,
+        tier=category,
         model=model,
         is_first=is_first,
     )
 
-    return tier
+    return category
 
 
 # ── Keyword Deviation Detection ─────────────────────────────────────────────
@@ -483,38 +603,58 @@ def _levenshtein(s1: str, s2: str) -> int:
     return prev[-1]
 
 
-def has_deviation(cfg: dict, text: str, current_tier: str, *, session_key: str | None = None) -> bool:
-    """Scan follow-up message for escalation/de-escalation keywords."""
-    # Escalation: simple → suddenly complex
-    if current_tier == "simple":
-        for kw in cfg["routing"].get("escalation_keywords", []):
-            if _fuzzy_match(kw, text):
-                log.info("Deviation: escalation keyword '%s' matched", kw)
-                new_tier = "complex"
-                model = cfg["models"][new_tier]["model"]
-                trace_deviation(
-                    session_key=session_key or "?",
-                    keyword=kw,
-                    direction="escalation",
-                    previous_tier=current_tier,
-                    new_tier=new_tier,
-                    model=model,
-                )
-                return True
+def has_deviation(cfg: dict, text: str, current_category: str, *, session_key: str | None = None) -> bool:
+    """Scan follow-up message for keywords that trigger re-classification.
 
-    # De-escalation: complex → suddenly casual
-    if current_tier == "complex":
+    With N categories, deviation is no longer a simple tier swap.
+    Instead, any escalation keyword triggers full re-classification.
+    De-escalation keywords force the default (first) category.
+    """
+    # Check for /use: override first
+    override = _detect_override(text, cfg)
+    if override and override != current_category:
+        model = cfg["categories"][override]["model"]
+        trace_deviation(
+            session_key=session_key or "?",
+            keyword=f"/use:{override}",
+            direction="override",
+            previous_tier=current_category,
+            new_tier=override,
+            model=model,
+        )
+        return True
+
+    # Escalation keywords — trigger re-classification
+    for kw in cfg["routing"].get("escalation_keywords", []):
+        if _fuzzy_match(kw, text):
+            log.info("Deviation: escalation keyword '%s' matched", kw)
+            names = _category_names(cfg)
+            new_cat = names[0] if names else "chat"
+            model = cfg["categories"].get(new_cat, {}).get("model", "unknown")
+            trace_deviation(
+                session_key=session_key or "?",
+                keyword=kw,
+                direction="escalation",
+                previous_tier=current_category,
+                new_tier=new_cat,
+                model=model,
+            )
+            return True
+
+    # De-escalation keywords — force default (first) category
+    names = _category_names(cfg)
+    default_cat = names[0] if names else "chat"
+    if current_category != default_cat:
         for kw in cfg["routing"].get("de_escalation_keywords", []):
             if _fuzzy_match(kw, text):
-                log.info("Deviation: de-escalation keyword '%s' matched", kw)
-                new_tier = "simple"
-                model = cfg["models"][new_tier]["model"]
+                log.info("Deviation: de-escalation keyword '%s' matched → %s", kw, default_cat)
+                model = cfg["categories"].get(default_cat, {}).get("model", "unknown")
                 trace_deviation(
                     session_key=session_key or "?",
                     keyword=kw,
                     direction="de_escalation",
-                    previous_tier=current_tier,
-                    new_tier=new_tier,
+                    previous_tier=current_category,
+                    new_tier=default_cat,
                     model=model,
                 )
                 return True
@@ -526,29 +666,29 @@ def has_deviation(cfg: dict, text: str, current_tier: str, *, session_key: str |
 
 # In-memory: session_key → {"tier": "simple"|"complex", "at": timestamp}
 SESSIONS: dict[str, dict[str, Any]] = {}
+SESSIONS_MAX = 500  # max cached sessions; oldest evicted on insert
 
 # ── Metrics ─────────────────────────────────────────────────────────────────
 # Prometheus-compatible counters for GET /metrics
 METRICS: dict[str, int] = {
-    "requests_total_simple": 0,
-    "requests_total_complex": 0,
     "classifier_calls_total": 0,
     "classifier_latency_ms_sum": 0,
     "cache_hits_total": 0,
     "429_total": 0,
-    "429_simple": 0,
-    "429_complex": 0,
     "fallback_used_total": 0,
     "fallback2_used_total": 0,
     "stream_requests_total": 0,
     "errors_total": 0,
+    "requests_total": 0,  # total requests regardless of category
 }
+# Per-category request/429 counters are dynamic: requests_total_<cat>, 429_<cat>
 
 # ── Circuit Breakers ────────────────────────────────────────────────────────
 # Per-endpoint circuit breakers that track consecutive 429s.
 # After N consecutive failures in a sliding window, open the circuit
 # (skip the endpoint entirely) for X seconds.
 CIRCUITS: dict[str, dict[str, Any]] = {}
+CIRCUITS_MAX = 50  # max circuit entries; excess evicted on insert
 
 # Defaults — overridable via router_config.yaml → circuit_breaker section
 CB_DEFAULTS: dict[str, int] = {
@@ -603,6 +743,11 @@ def _circuit_record_failure(cfg: dict, base_url: str, model: str = "") -> None:
     """Record a failure (429) and potentially open the circuit."""
     cb_cfg = cfg.get("circuit_breaker", CB_DEFAULTS)
     key = _circuit_key(base_url, model)
+    if len(CIRCUITS) >= CIRCUITS_MAX and key not in CIRCUITS:
+        for ck, cv in list(CIRCUITS.items()):
+            if cv.get("state") == "closed":
+                del CIRCUITS[ck]
+                break
     entry = CIRCUITS.get(key, {"state": "closed", "failures": 0, "last_failure_at": 0})
     now = time.time()
     window = cb_cfg.get("window_sec", 60)
@@ -630,7 +775,7 @@ def _inc_metric(name: str, delta: int = 1) -> None:
 
 
 def _inc_metric_tier(tier: str, name: str, delta: int = 1) -> None:
-    """Increment a tier-scoped metric: {name}_{tier}."""
+    """Increment a category-scoped metric: {name}_{tier}."""
     _inc_metric(f"{name}_{tier}", delta)
 
 
@@ -685,6 +830,10 @@ def get_cached_tier(cfg: dict, key: str) -> str | None:
 
 
 def cache_tier(key: str, tier: str) -> None:
+    if len(SESSIONS) >= SESSIONS_MAX:
+        oldest = min(SESSIONS, key=lambda k: SESSIONS[k].get("at", 0))
+        del SESSIONS[oldest]
+        log.debug("Evicted oldest session %s (cache full)", oldest)
     SESSIONS[key] = {"tier": tier, "at": time.time()}
     log.info("Session %s → %s (cached)", key, tier)
 
@@ -694,40 +843,71 @@ _RETRYABLE_EXC = (httpx.RemoteProtocolError, httpx.ConnectError, httpx.ReadTimeo
 _RETRY_MAX = 2  # total attempts = 1 + _RETRY_MAX = 3
 
 
-def _post_with_retry(
+async def _post_with_retry(
     url: str,
     *,
     json: dict,
     headers: dict,
     timeout: httpx.Timeout,
     label: str = "",
+    client: httpx.AsyncClient | None = None,
 ) -> httpx.Response:
-    """httpx POST with built-in retry for transient transport errors.
+    """Async httpx POST with built-in retry for transient transport errors.
 
     RemoteProtocolError / ConnectError / ReadTimeout / ConnectTimeout are
     retried up to _RETRY_MAX times with 1-second backoff.  Non-transient
     errors (4xx, 5xx) are returned as-is so the caller can handle fallback.
-    """
-    last_exc: Exception | None = None
-    for attempt in range(_RETRY_MAX + 1):
-        try:
-            return httpx.post(url, json=json, headers=headers, timeout=timeout)
-        except _RETRYABLE_EXC as exc:
-            last_exc = exc
-            if attempt < _RETRY_MAX:
-                delay = 1.0 * (attempt + 1)
-                log.warning(
-                    "%s transient error (attempt %s/%s): %s — retrying in %.1fs",
-                    label, attempt + 1, _RETRY_MAX + 1, exc, delay,
-                )
-                time.sleep(delay)
-            else:
-                log.error(
-                    "%s exhausted %s retries: %s", label, _RETRY_MAX + 1, exc
-                )
-    raise last_exc  # type: ignore[misc]
 
-def call_model(
+    If *client* is provided, reuses it; otherwise creates a short-lived client.
+    """
+    own_client = client is None
+    last_exc: Exception | None = None
+    try:
+        if own_client:
+            async with httpx.AsyncClient() as own:
+                for attempt in range(_RETRY_MAX + 1):
+                    try:
+                        return await own.post(url, json=json, headers=headers, timeout=timeout)
+                    except _RETRYABLE_EXC as exc:
+                        last_exc = exc
+                        if attempt < _RETRY_MAX:
+                            delay = 1.0 * (attempt + 1)
+                            log.warning(
+                                "%s transient error (attempt %s/%s): %s — retrying in %.1fs",
+                                label, attempt + 1, _RETRY_MAX + 1, exc, delay,
+                            )
+                            await asyncio.sleep(delay)
+                        else:
+                            log.error(
+                                "%s exhausted %s retries: %s", label, _RETRY_MAX + 1, exc
+                            )
+                raise last_exc  # type: ignore[misc]
+        else:
+            for attempt in range(_RETRY_MAX + 1):
+                try:
+                    return await client.post(url, json=json, headers=headers, timeout=timeout)
+                except _RETRYABLE_EXC as exc:
+                    last_exc = exc
+                    if attempt < _RETRY_MAX:
+                        delay = 1.0 * (attempt + 1)
+                        log.warning(
+                            "%s transient error (attempt %s/%s): %s — retrying in %.1fs",
+                            label, attempt + 1, _RETRY_MAX + 1, exc, delay,
+                        )
+                        await asyncio.sleep(delay)
+                    else:
+                        log.error(
+                            "%s exhausted %s retries: %s", label, _RETRY_MAX + 1, exc
+                        )
+            raise last_exc  # type: ignore[misc]
+    except _RETRYABLE_EXC:
+        raise
+    except Exception as exc:
+        if last_exc and isinstance(exc, type(last_exc)):
+            raise
+        raise
+
+async def call_model(
     cfg: dict, model_cfg: dict, request_payload: dict
 ) -> httpx.Response:
     """Call an OpenAI-compatible endpoint. Returns the httpx response.
@@ -737,6 +917,7 @@ def call_model(
     retries with alternate_key_env before giving up.
     503 retry: HTTP 503 (overloaded) retries up to 3x with exponential backoff
     (2s, 4s, 8s) so transient overloads are resolved before escalation.
+    Uses _post_with_retry for transient transport error resilience.
     """
     base_url = model_cfg["base_url"].rstrip("/")
     url = f"{base_url}/chat/completions"
@@ -760,110 +941,97 @@ def call_model(
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
 
-    # ── 503 retry: exponential backoff (2s, 4s, 8s) ──────────────────────────
-    _503_retries = 3
-    _503_backoff = [2.0, 4.0, 8.0]
-    for attempt_503 in range(_503_retries):
-        try:
-            resp = httpx.post(url, json=payload, headers=headers, timeout=httpx.Timeout(timeout))
-        except Exception as exc:
-            log.warning("Transport error for %s: %s", model_cfg["model"], exc)
-            # Let caller handle fallback — don't retry transport-level here
-            r = httpx.Response(503, text=str(exc))
-            r._request = httpx.Request("POST", url)
-            return r
+    async with httpx.AsyncClient() as client:
+        # ── 503 retry: exponential backoff (2s, 4s, 8s) ──────────────────────────
+        _503_retries = 3
+        _503_backoff = [2.0, 4.0, 8.0]
+        resp: httpx.Response = httpx.Response(503, text="No response received")
+        resp._request = httpx.Request("POST", url)
+        for attempt_503 in range(_503_retries):
+            try:
+                resp = await _post_with_retry(
+                    url, json=payload, headers=headers,
+                    timeout=httpx.Timeout(timeout),
+                    label=f"call_model({model_name})",
+                    client=client,
+                )
+            except Exception as exc:
+                log.warning("Transport error for %s: %s", model_cfg["model"], exc)
+                # Let caller handle fallback — don't retry transport-level here
+                r = httpx.Response(503, text=str(exc))
+                r._request = httpx.Request("POST", url)
+                return r
 
-        if resp.status_code != 503:
-            break
+            if resp.status_code != 503:
+                break
 
-        if attempt_503 < _503_retries - 1:
-            delay = _503_backoff[attempt_503]
-            err_brief = resp.text[:150] if resp.text else ""
-            log.warning(
-                "HTTP 503 for %s (attempt %s/%s) — backing off %.1fs: %s",
-                model_cfg["model"], attempt_503 + 1, _503_retries, delay, err_brief,
-            )
-            time.sleep(delay)
-        else:
-            err_brief = resp.text[:150] if resp.text else ""
-            log.error(
-                "HTTP 503 exhausted %s retries for %s: %s",
-                _503_retries, model_cfg["model"], err_brief,
-            )
+            if attempt_503 < _503_retries - 1:
+                delay = _503_backoff[attempt_503]
+                err_brief = resp.text[:150] if resp.text else ""
+                log.warning(
+                    "HTTP 503 for %s (attempt %s/%s) — backing off %.1fs: %s",
+                    model_cfg["model"], attempt_503 + 1, _503_retries, delay, err_brief,
+                )
+                await asyncio.sleep(delay)
+            else:
+                err_brief = resp.text[:150] if resp.text else ""
+                log.error(
+                    "HTTP 503 exhausted %s retries for %s: %s",
+                    _503_retries, model_cfg["model"], err_brief,
+                )
 
-    # Circuit + metric tracking
-    if resp.status_code == 429:
-        _circuit_record_failure(cfg, base_url, model_name)
-        _inc_metric_tier(model_cfg.get("tier", "unknown"), "429")
-        _inc_metric("429_total")
-    elif resp.status_code in (502, 503, 504):
-        _circuit_record_failure(cfg, base_url, model_name)
-    elif resp.status_code == 200:
-        _circuit_record_success(cfg, base_url, model_name)
-
-    # Key rotation: HTTP 429 with alternate key available -> retry
-    if resp.status_code == 429 and alt_key:
-        log.warning("Primary key rate-limited (429) - switching to alternate key")
-        trace_key_rotation(
-            base_url=base_url,
-            tier=model_cfg.get("tier", "unknown"),
-            reason="429_rate_limit",
-        )
-        try:
-            resp = httpx.post(
-                url,
-                json=payload,
-                headers={"Content-Type": "application/json", "Authorization": f"Bearer {alt_key}"},
-                timeout=httpx.Timeout(timeout),
-            )
-        except Exception:
-            pass
-        if resp.status_code == 200:
-            log.info("Alternate key succeeded")
+        # Circuit + metric tracking
+        if resp.status_code == 429:
+            _circuit_record_failure(cfg, base_url, model_name)
+            _inc_metric_tier(model_cfg.get("tier", "unknown"), "429")
+            _inc_metric("429_total")
+        elif resp.status_code in (502, 503, 504):
+            _circuit_record_failure(cfg, base_url, model_name)
+        elif resp.status_code == 200:
             _circuit_record_success(cfg, base_url, model_name)
+            _clear_retry(session_key(request_payload.get("messages", [])) or "")
+
+        # Key rotation: HTTP 429 with alternate key available -> retry
+        if resp.status_code == 429 and alt_key:
+            log.warning("Primary key rate-limited (429) - switching to alternate key")
+            trace_key_rotation(
+                base_url=base_url,
+                tier=model_cfg.get("tier", "unknown"),
+                reason="429_rate_limit",
+            )
+            try:
+                resp = await client.post(
+                    url,
+                    json=payload,
+                    headers={"Content-Type": "application/json", "Authorization": f"Bearer {alt_key}"},
+                    timeout=httpx.Timeout(timeout),
+                )
+            except Exception as exc:
+                log.warning("Alternate key request failed for %s: %s", model_name, exc)
+            if resp.status_code == 429:
+                _circuit_record_failure(cfg, base_url, model_name)
+                _inc_metric_tier(model_cfg.get("tier", "unknown"), "429")
+                _inc_metric("429_total")
+                log.warning("Alternate key also rate-limited for %s", model_name)
+            elif resp.status_code == 200:
+                log.info("Alternate key succeeded")
+                _circuit_record_success(cfg, base_url, model_name)
+                _clear_retry(session_key(request_payload.get("messages", [])) or "")
 
     return resp
-
-
-async def call_model_stream(model_cfg: dict, request_payload: dict):
-    """Async generator that yields SSE chunks from an upstream model."""
-    url = f"{model_cfg['base_url'].rstrip('/')}/chat/completions"
-    api_key = env_key(model_cfg["api_key_env"])
-    timeout = model_cfg.get("timeout_seconds", 120)
-
-    payload = {**request_payload, "model": model_cfg["model"]}
-    headers: dict[str, str] = {"Content-Type": "application/json"}
-    if api_key:
-        headers["Authorization"] = f"Bearer {api_key}"
-
-    async with httpx.AsyncClient() as client:
-        async with client.stream(
-            "POST", url, json=payload, headers=headers,
-            timeout=httpx.Timeout(timeout),
-        ) as resp:
-            if resp.status_code != 200:
-                body = await resp.aread()
-                yield f'data: {{"error":{{"message":"Upstream {resp.status_code}: {body.decode(errors="replace")[:300]}","type":"upstream_error"}}}}\n\n'.encode()
-                yield b'data: [DONE]\n\n'
-                return
-
-            async for line in resp.aiter_lines():
-                if line and line.startswith("data: "):
-                    yield f"{line}\n".encode()
-                elif line.strip() == "":
-                    yield b"\n"
-
-        # Add router metadata to final chunk
-        yield b''  # sentinel - metadata handled by wrapper
 
 
 # ── Retry-tracking: count consecutive primary failures per session.
 # Only after N failures does the next gateway retry skip to fallback.
 _RETRY_STATE: dict[str, int] = {}  # session_key → consecutive failure count
 _RETRY_MAX_BEFORE_FALLBACK = 3
+_RETRY_STATE_MAX = 200  # max tracked sessions; oldest evicted on insert
 
 def _record_failure(key: str) -> int:
     """Increment failure counter, return new count."""
+    if len(_RETRY_STATE) >= _RETRY_STATE_MAX and key not in _RETRY_STATE:
+        oldest_key = next(iter(_RETRY_STATE))
+        del _RETRY_STATE[oldest_key]
     cnt = _RETRY_STATE.get(key, 0) + 1
     _RETRY_STATE[key] = cnt
     return cnt
@@ -891,39 +1059,80 @@ async def route_request_stream(cfg: dict, payload: dict):
         yield b'data: {"error":{"message":"No user message found","type":"router_error"}}\n\ndata: [DONE]\n\n'
         return
 
-    # ── Determine tier (reuse sync logic from cache) ──────────────────
-    tier: str
+    # ── Determine category ──────────────────────────────────────────
+    category: str
     if is_first_message(messages):
         user_content = _last_user_text(messages)
-        tier = classify(cfg, user_content, session_key=key, is_first=True)
-        cache_tier(key, tier)
+        override = _detect_override(user_content, cfg)
+        if override:
+            category = override
+            clean_text = _strip_override(user_content, cfg)
+            if clean_text:
+                for m in messages:
+                    if m.get("role") == "user":
+                        if isinstance(m.get("content"), str):
+                            m["content"] = clean_text
+                        break
+                payload["messages"] = messages
+            log.info("Session %s override: → %s", key, category)
+        else:
+            category = classify(cfg, user_content, session_key=key, is_first=True)
+        cache_tier(key, category)
     else:
         cached = get_cached_tier(cfg, key)
         if cached is None:
             user_content = _last_user_text(messages)
-            tier = classify(cfg, user_content, session_key=key, is_first=False)
-            cache_tier(key, tier)
+            override = _detect_override(user_content, cfg)
+            if override:
+                category = override
+                clean_text = _strip_override(user_content, cfg)
+                if clean_text:
+                    for m in messages:
+                        if m.get("role") == "user":
+                            if isinstance(m.get("content"), str):
+                                m["content"] = clean_text
+                            break
+                    payload["messages"] = messages
+            else:
+                category = classify(cfg, user_content, session_key=key, is_first=False)
+            cache_tier(key, category)
         else:
             last_text = _last_user_text(messages)
             if has_deviation(cfg, last_text, cached, session_key=key):
-                user_content = _last_user_text(messages)
-                tier = classify(cfg, user_content, session_key=key, is_first=False)
-                cache_tier(key, tier)
+                override = _detect_override(last_text, cfg)
+                if override:
+                    category = override
+                    clean_text = _strip_override(last_text, cfg)
+                    if clean_text:
+                        for m in messages:
+                            if m.get("role") == "user":
+                                if isinstance(m.get("content"), str):
+                                    m["content"] = clean_text
+                                break
+                        payload["messages"] = messages
+                else:
+                    user_content = _last_user_text(messages)
+                    category = classify(cfg, user_content, session_key=key, is_first=False)
+                cache_tier(key, category)
             else:
-                tier = cached
+                category = cached
                 _inc_metric("cache_hits_total")
-                # ── Trace: cache hit ─────────────────────────────────
                 cache_entry = SESSIONS.get(key, {})
+                cat_cfg_cached = cfg["categories"].get(category, {})
                 trace_cache_hit(
                     session_key=key,
-                    tier=tier,
-                    model=cfg["models"][tier]["model"],
+                    tier=category,
+                    model=cat_cfg_cached.get("model", "unknown"),
                     age_sec=time.time() - cache_entry.get("at", time.time()),
                 )
 
-    model_cfg = cfg["models"][tier]
+    model_cfg = cfg["categories"].get(category, {})
+    if not model_cfg:
+        yield b'data: {"error":{"message":"Category has no model config","type":"router_error"}}\n\ndata: [DONE]\n\n'
+        return
+    model_cfg = model_cfg.copy()
 
-    # ── Build tier attempt list: primary, fallback1, fallback2 ─────────
+    # ── Build attempt list: primary, fallback1, fallback2 ─────────
     # Each entry: (label, model_cfg_dict)
     # If session has N consecutive failures, skip primary and start at fallback.
     tier_attempts: list[tuple[str, dict]] = []
@@ -948,7 +1157,7 @@ async def route_request_stream(cfg: dict, payload: dict):
             "api_key_env": model_cfg.get("fallback_key_env", ""),
             "alternate_key_env": model_cfg.get("fallback_alternate_key_env", ""),
             "timeout_seconds": model_cfg.get("timeout_seconds", 120),
-            "tier": tier,
+            "tier": category,
         }
         tier_attempts.append(("fallback1", fb1_cfg))
 
@@ -961,13 +1170,13 @@ async def route_request_stream(cfg: dict, payload: dict):
             "api_key_env": model_cfg.get("fallback2_key_env", ""),
             "alternate_key_env": model_cfg.get("fallback2_alternate_key_env", ""),
             "timeout_seconds": model_cfg.get("timeout_seconds", 120),
-            "tier": tier,
+            "tier": category,
         }
         tier_attempts.append(("fallback2", fb2_cfg))
 
     # ── Try each tier in order until one streams successfully ───────────
     async with httpx.AsyncClient() as client:
-        for attempt_label, attempt_cfg in tier_attempts:
+        for attempt_idx, (attempt_label, attempt_cfg) in enumerate(tier_attempts):
             model_name = attempt_cfg["model"]
             log.info("Streaming attempt %s: %s → %s", attempt_label, key, model_name)
 
@@ -976,11 +1185,11 @@ async def route_request_stream(cfg: dict, payload: dict):
             if _circuit_is_open(cfg, base_url, model_name):
                 log.warning("Circuit open for %s — skipping %s", base_url, model_name)
                 trace_route(
-                    session_key=key, tier=tier, model=model_name,
+                    session_key=key, tier=category, model=model_name,
                     upstream_status=429, stream=True,
-                    fallback_level=tier_attempts.index((attempt_label, attempt_cfg)) + 1,
+                    fallback_level=attempt_idx + 1,
                 )
-                _inc_metric_tier(tier, "429")
+                _inc_metric_tier(category, "429")
                 continue  # try next tier
 
             stream_url = f"{base_url}/chat/completions"
@@ -1013,18 +1222,18 @@ async def route_request_stream(cfg: dict, payload: dict):
                             log.warning("Streaming %s got 429 (%s key): %s",
                                         model_name, key_label, err_text[:100])
                             _circuit_record_failure(cfg, base_url, model_name)
-                            _inc_metric_tier(tier, "429")
+                            _inc_metric_tier(category, "429")
                             _inc_metric("429_total")
 
                             if key_label == "primary_key" and alt_key:
                                 trace_key_rotation(
-                                    base_url=base_url, tier=tier,
+                                    base_url=base_url, tier=category,
                                     reason="429_rate_limit_stream",
                                 )
                                 continue  # try alternate key
 
                             trace_route(
-                                session_key=key, tier=tier, model=model_name,
+                                session_key=key, tier=category, model=model_name,
                                 upstream_status=429, stream=True,
                                 fallback_level=tier_attempts.index((attempt_label, attempt_cfg)) + 1,
                             )
@@ -1055,7 +1264,7 @@ async def route_request_stream(cfg: dict, payload: dict):
                                                 log.info("Streaming %s OK after 503 retry %d", model_name, retry_i + 2)
                                                 _circuit_record_success(cfg, base_url, model_name)
                                                 trace_route(
-                                                    session_key=key, tier=tier, model=model_name,
+                                                    session_key=key, tier=category, model=model_name,
                                                     upstream_status=200, stream=True,
                                                 )
                                                 if attempt_label != "primary":
@@ -1092,17 +1301,17 @@ async def route_request_stream(cfg: dict, payload: dict):
                             log.warning("Streaming %s returned %d: %s",
                                         model_name, resp.status_code, err_text[:150])
                             trace_route(
-                                session_key=key, tier=tier, model=model_name,
+                                session_key=key, tier=category, model=model_name,
                                 upstream_status=resp.status_code, stream=True,
                             )
                             break  # non-429 error on this tier, try next
 
                         # ── Stream successfully opened ───────────────────
                         log.info("Streaming %s OK (key=%s)", model_name, key_label)
-                        if key_label == "alternate_key":
-                            _circuit_record_success(cfg, base_url, model_name)
+                        # Bug #13: Record circuit success for any successful key, not just alternate
+                        _circuit_record_success(cfg, base_url, model_name)
                         trace_route(
-                            session_key=key, tier=tier, model=model_name,
+                            session_key=key, tier=category, model=model_name,
                             upstream_status=200, stream=True,
                         )
                         if attempt_label != "primary":
@@ -1148,119 +1357,164 @@ async def route_request_stream(cfg: dict, payload: dict):
 
     # ── All tiers exhausted ────────────────────────────────────────
     log.error("All streaming tiers exhausted for session %s", key)
-    yield f'data: {{"error":{{"message":"All upstream models failed","type":"upstream_error"}}}}\n\n'.encode()
+    yield b'data: {"error":{"message":"All upstream models failed","type":"upstream_error"}}\n\n'
     yield b'data: [DONE]\n\n'
 
 
-def route_request(cfg: dict, payload: dict) -> JSONResponse:
+async def route_request(cfg: dict, payload: dict) -> JSONResponse:
     """
-    Full routing pipeline.  Determines the model tier, calls it
-    (with fallback), and returns a FastAPI JSONResponse.
+    Full routing pipeline.  Determines the category, calls the mapped
+    model (with fallback), and returns a FastAPI JSONResponse.
     """
     messages = payload.get("messages", [])
     key = session_key(messages)
     if not key:
         return _error(400, "No user message found in request")
 
-    # ── Determine tier ──────────────────────────────────────────────────
-    tier: str
+    # ── Determine category ──────────────────────────────────────────────
+    category: str
 
     if is_first_message(messages):
-        # Brand new session — classify via flash model only.
-        # No keyword override — first messages are classifier territory.
         user_content = _last_user_text(messages)
-        tier = classify(cfg, user_content, session_key=key, is_first=True)
-        cache_tier(key, tier)
+        # Check for /use: override on first message
+        override = _detect_override(user_content, cfg)
+        if override:
+            category = override
+            log.info("Session %s override: → %s", key, category)
+            # Strip the override prefix from the actual message sent upstream
+            clean_text = _strip_override(user_content, cfg)
+            if clean_text:
+                # Replace the user message content for upstream
+                for m in messages:
+                    if m.get("role") == "user":
+                        if isinstance(m.get("content"), str):
+                            m["content"] = clean_text
+                        break
+                payload["messages"] = messages
+            cache_tier(key, category)
+        else:
+            category = classify(cfg, user_content, session_key=key, is_first=True)
+            cache_tier(key, category)
 
     else:
-        # Follow-up message — check cache + keyword deviation
         cached = get_cached_tier(cfg, key)
         if cached is None:
-            # Expired — re-classify
             user_content = _last_user_text(messages)
-            tier = classify(cfg, user_content, session_key=key, is_first=False)
-            cache_tier(key, tier)
+            # Check override on follow-up too
+            override = _detect_override(user_content, cfg)
+            if override:
+                category = override
+                clean_text = _strip_override(user_content, cfg)
+                if clean_text:
+                    for m in messages:
+                        if m.get("role") == "user":
+                            if isinstance(m.get("content"), str):
+                                m["content"] = clean_text
+                            break
+                    payload["messages"] = messages
+            else:
+                category = classify(cfg, user_content, session_key=key, is_first=False)
+            cache_tier(key, category)
         else:
             last_text = _last_user_text(messages)
             if has_deviation(cfg, last_text, cached, session_key=key):
-                user_content = _last_user_text(messages)
-                tier = classify(cfg, user_content, session_key=key, is_first=False)
-                if tier != cached:
-                    log.info(
-                        "Session %s tier changed: %s → %s", key, cached, tier
-                    )
+                # Check if it's an override
+                override = _detect_override(last_text, cfg)
+                if override:
+                    category = override
+                    clean_text = _strip_override(last_text, cfg)
+                    if clean_text:
+                        for m in messages:
+                            if m.get("role") == "user":
+                                if isinstance(m.get("content"), str):
+                                    m["content"] = clean_text
+                                break
+                        payload["messages"] = messages
                 else:
-                    log.info(
-                        "Session %s deviation detected but tier unchanged: %s",
-                        key, tier,
-                    )
-                cache_tier(key, tier)
+                    user_content = _last_user_text(messages)
+                    category = classify(cfg, user_content, session_key=key, is_first=False)
+                if category != cached:
+                    log.info("Session %s category changed: %s → %s", key, cached, category)
+                cache_tier(key, category)
             else:
-                tier = cached
+                category = cached
                 _inc_metric("cache_hits_total")
-                # ── Trace: cache hit ─────────────────────────────────────
                 cache_entry = SESSIONS.get(key, {})
+                cat_cfg = cfg["categories"].get(category, {})
                 trace_cache_hit(
                     session_key=key,
-                    tier=tier,
-                    model=cfg["models"][tier]["model"],
+                    tier=category,
+                    model=cat_cfg.get("model", "unknown"),
                     age_sec=time.time() - cache_entry.get("at", time.time()),
                 )
 
     # ── Call model ──────────────────────────────────────────────────────
-    model_cfg = cfg["models"][tier]
-    model_cfg["tier"] = tier  # for circuit breaker metric labeling
-    _inc_metric_tier(tier, "requests_total")
-    log.info("Routing session %s → %s (%s)", key, tier, model_cfg["model"])
+    cat_cfg = cfg["categories"].get(category, {}).copy()
+    if not cat_cfg:
+        return _error(500, f"Category '{category}' has no model config")
+    cat_cfg["tier"] = category  # for circuit breaker metric labeling
+    _inc_metric_tier(category, "requests_total")
+    log.info("Routing session %s → %s (%s)", key, category, cat_cfg["model"])
 
-    resp = call_model(cfg, model_cfg, payload)
+    # Skip primary if session has 3+ consecutive failures (3-strike fallback)
+    skip_primary = _should_use_fallback(key)
+    if skip_primary and cat_cfg.get("fallback_model"):
+        log.info("Session %s has %d consecutive failures — skipping primary %s",
+                 key, _RETRY_STATE.get(key, 0), cat_cfg["model"])
 
-    if resp.status_code == 200:
-        trace_route(
-            session_key=key, tier=tier, model=model_cfg["model"],
-            upstream_status=200, stream=False,
-        )
-        return JSONResponse(content=resp.json())
+    if not skip_primary or not cat_cfg.get("fallback_model"):
+        resp = await call_model(cfg, cat_cfg, payload)
+
+        if resp.status_code == 200:
+            trace_route(
+                session_key=key, tier=category, model=cat_cfg["model"],
+                upstream_status=200, stream=False,
+            )
+            _clear_retry(key)
+            return JSONResponse(content=resp.json())
+    else:
+        resp = httpx.Response(503, text="Skipped primary due to consecutive failures")
+        resp._request = httpx.Request("POST", f"{cat_cfg['base_url'].rstrip('/')}/chat/completions")
 
     # ── Fallback ────────────────────────────────────────────────────────
-    fallback_model = model_cfg.get("fallback_model")
+    fallback_model = cat_cfg.get("fallback_model")
     if not fallback_model:
         return _proxy_error(resp)
 
     log.warning(
         "Primary model %s returned %d — trying fallback %s",
-        model_cfg["model"],
+        cat_cfg["model"],
         resp.status_code,
         fallback_model,
     )
 
     _inc_metric("fallback_used_total")
     trace_route(
-        session_key=key, tier=tier, model=model_cfg["model"],
+        session_key=key, tier=category, model=cat_cfg["model"],
         upstream_status=resp.status_code, stream=False,
         fallback_level=1, fallback_model=fallback_model,
     )
     fb_cfg = {
         "model": fallback_model,
-        "base_url": model_cfg["fallback_base_url"],
-        "api_key_env": model_cfg["fallback_key_env"],
-        "alternate_key_env": model_cfg.get("fallback_alternate_key_env", ""),
-        "timeout_seconds": model_cfg.get("timeout_seconds", 120),
-        "tier": tier,
+        "base_url": cat_cfg["fallback_base_url"],
+        "api_key_env": cat_cfg["fallback_key_env"],
+        "alternate_key_env": cat_cfg.get("fallback_alternate_key_env", ""),
+        "timeout_seconds": cat_cfg.get("timeout_seconds", 120),
+        "tier": category,
     }
-    fb_resp = call_model(cfg, fb_cfg, payload)
+    fb_resp = await call_model(cfg, fb_cfg, payload)
 
     if fb_resp.status_code == 200:
         data = fb_resp.json()
         data.setdefault("hermes_router", {})["fallback_used"] = True
         trace_route(
-            session_key=key, tier=tier, model=fallback_model,
+            session_key=key, tier=category, model=fallback_model,
             upstream_status=200, stream=False,
         )
         return JSONResponse(content=data)
 
     # ── Fallback 2 ─────────────────────────────────────────────────────────
-    fb2_model = model_cfg.get("fallback2_model")
+    fb2_model = cat_cfg.get("fallback2_model")
     if fb2_model:
         log.warning(
             "Fallback %s returned %d — trying fallback2 %s",
@@ -1268,24 +1522,24 @@ def route_request(cfg: dict, payload: dict) -> JSONResponse:
         )
         _inc_metric("fallback2_used_total")
         trace_route(
-            session_key=key, tier=tier, model=fallback_model,
+            session_key=key, tier=category, model=fallback_model,
             upstream_status=fb_resp.status_code, stream=False,
             fallback_level=2, fallback_model=fb2_model,
         )
         fb2_cfg = {
             "model": fb2_model,
-            "base_url": model_cfg["fallback2_base_url"],
-            "api_key_env": model_cfg["fallback2_key_env"],
-            "alternate_key_env": model_cfg.get("fallback2_alternate_key_env", ""),
-            "timeout_seconds": model_cfg.get("timeout_seconds", 120),
-            "tier": tier,
+            "base_url": cat_cfg["fallback2_base_url"],
+            "api_key_env": cat_cfg["fallback2_key_env"],
+            "alternate_key_env": cat_cfg.get("fallback2_alternate_key_env", ""),
+            "timeout_seconds": cat_cfg.get("timeout_seconds", 120),
+            "tier": category,
         }
-        fb2_resp = call_model(cfg, fb2_cfg, payload)
+        fb2_resp = await call_model(cfg, fb2_cfg, payload)
         if fb2_resp.status_code == 200:
             data = fb2_resp.json()
             data.setdefault("hermes_router", {})["fallback_used"] = True
             trace_route(
-                session_key=key, tier=tier, model=fb2_model,
+                session_key=key, tier=category, model=fb2_model,
                 upstream_status=200, stream=False,
             )
             return JSONResponse(content=data)
@@ -1341,9 +1595,15 @@ def verify_auth(request: Request):
         return  # No auth configured — allow all
     expected = os.environ.get(key_env, "").strip()
     if not expected:
-        return  # Env var not set — allow all
+        # Bug #22 fix: If auth is explicitly configured but the env var is
+        # empty, reject all requests rather than silently allowing them.
+        raise HTTPException(
+            status_code=401,
+            detail={"error": {"message": "API key env var is empty — auth required", "type": "auth_error"}},
+        )
     auth_header = request.headers.get("Authorization", "")
-    if auth_header.startswith("Bearer ") and auth_header[7:] == expected:
+    token = auth_header[7:] if auth_header.startswith("Bearer ") else ""
+    if hmac.compare_digest(token, expected):
         return
     raise HTTPException(
         status_code=401,
@@ -1371,15 +1631,19 @@ app.add_middleware(
 
 @app.on_event("startup")
 def _startup() -> None:
+    # Note: deprecated in FastAPI 0.93+ but functional.
     cfg = load_config()
     log.info("Router starting on %s:%s", cfg["server"]["host"], cfg["server"]["port"])
     log.info("  Classifier: %s (%s)", cfg["classifier"]["model"], cfg["classifier"]["base_url"])
-    log.info("  Simple model: %s (%s)", cfg["models"]["simple"]["model"], cfg["models"]["simple"]["base_url"])
-    log.info("  Complex model: %s (%s)", cfg["models"]["complex"]["model"], cfg["models"]["complex"]["base_url"])
-    if cfg["models"]["complex"].get("fallback_model"):
-        log.info("  Fallback: %s (%s)", cfg["models"]["complex"]["fallback_model"], cfg["models"]["complex"]["fallback_base_url"])
-    if cfg["models"]["complex"].get("fallback2_model"):
-        log.info("  Fallback2: %s (%s)", cfg["models"]["complex"]["fallback2_model"], cfg["models"]["complex"]["fallback2_base_url"])
+    cats = cfg.get("categories", {})
+    log.info("  Categories (%d):", len(cats))
+    for name, c in cats.items():
+        label = c.get("label", name)
+        log.info("    %s (%s): %s (%s)", name, label, c.get("model", "?"), c.get("base_url", "?"))
+        if c.get("fallback_model"):
+            log.info("      fallback: %s (%s)", c.get("fallback_model", "?"), c.get("fallback_base_url", "?"))
+    if not cats:
+        log.error("  No categories configured — router will fail on all requests")
     app.state.config = cfg
 
 
@@ -1400,8 +1664,7 @@ async def reload_config(request: Request):
     verify_auth(request)
 
     old_cfg = request.app.state.config
-    old_simple = old_cfg["models"]["simple"]["model"]
-    old_complex = old_cfg["models"]["complex"]["model"]
+    old_cats = list(old_cfg.get("categories", {}).keys())
 
     try:
         new_cfg = load_config()
@@ -1413,38 +1676,38 @@ async def reload_config(request: Request):
         )
 
     # Validate minimum structure
-    for section in ("classifier", "models", "routing", "server"):
+    for section in ("classifier", "routing", "server"):
         if section not in new_cfg:
             raise HTTPException(
                 status_code=400,
                 detail={"error": {"message": f"Missing required section: {section}", "type": "reload_error"}},
             )
-    for tier in ("simple", "complex"):
-        if tier not in new_cfg.get("models", {}):
-            raise HTTPException(
-                status_code=400,
-                detail={"error": {"message": f"Missing models.{tier} in config", "type": "reload_error"}},
-            )
+    if "categories" not in new_cfg or not new_cfg["categories"]:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": {"message": "Missing or empty 'categories' section in config", "type": "reload_error"}},
+        )
 
     # Clear profile_hint so extraction runs with fresh config
     new_cfg["classifier"]["profile_hint"] = ""
 
+    # Bug #20: Reset surrogate singleton so it reloads with new config
+    global _surrogate
+    _surrogate = None
+
     # Atomic swap
     request.app.state.config = new_cfg
 
+    new_cats = list(new_cfg.get("categories", {}).keys())
     log.info(
-        "Config hot-reloaded. Simple: %s → %s, Complex: %s → %s",
-        old_simple, new_cfg["models"]["simple"]["model"],
-        old_complex, new_cfg["models"]["complex"]["model"],
+        "Config hot-reloaded. Categories: %s → %s",
+        old_cats, new_cats,
     )
 
     return {
         "status": "reloaded",
-        "before": {"simple": old_simple, "complex": old_complex},
-        "after": {
-            "simple": new_cfg["models"]["simple"]["model"],
-            "complex": new_cfg["models"]["complex"]["model"],
-        },
+        "before": {"categories": old_cats},
+        "after": {"categories": new_cats},
     }
 
 
@@ -1541,8 +1804,6 @@ def _build_classifier_report(cfg: dict) -> dict:
     keyword_events = 0
     route_events = 0
     surrogate_confidences: list[float] = []
-    surrogate_agreements = 0
-    surrogate_disagreements = 0
     model_counts: dict[str, int] = {}
     stream_errors = 0
     fallback1_events = 0
@@ -1555,7 +1816,6 @@ def _build_classifier_report(cfg: dict) -> dict:
         
         if etype == "classify":
             model = ev.get("model", "")
-            result = ev.get("classifier_result", "")
             raw = ev.get("classifier_raw", "")
             
             if model.startswith("surrogate/"):
@@ -1818,7 +2078,7 @@ async def chat_completions(request: Request):
                 route_request_stream(cfg, payload),
                 media_type="text/event-stream",
             )
-        return route_request(cfg, payload)
+        return await route_request(cfg, payload)
     except Exception:
         _inc_metric("errors_total")
         raise
@@ -1829,13 +2089,19 @@ async def metrics(request: Request):
     """Prometheus-compatible metrics endpoint with router-specific counters."""
     verify_auth(request)
     m = _get_metrics()
-    # Prometheus text format
+    cfg = request.app.state.config
+    cats = cfg.get("categories", {})
+
+    # Build dynamic per-category metric lines
     lines = [
-        "# HELP hermes_router_requests_total Total requests by tier",
+        "# HELP hermes_router_requests_total Total requests by category",
         "# TYPE hermes_router_requests_total counter",
-        f"hermes_router_requests_total{{tier=\"simple\"}} {m['requests_total_simple']}",
-        f"hermes_router_requests_total{{tier=\"complex\"}} {m['requests_total_complex']}",
-        "",
+    ]
+    for name in cats:
+        lines.append(f"hermes_router_requests_total{{category=\"{name}\"}} {m.get(f'requests_total_{name}', 0)}")
+    lines.append("")
+
+    lines += [
         "# HELP hermes_router_classifier_calls_total Classifier model calls",
         "# TYPE hermes_router_classifier_calls_total counter",
         f"hermes_router_classifier_calls_total {m['classifier_calls_total']}",
@@ -1849,12 +2115,15 @@ async def metrics(request: Request):
         "# TYPE hermes_router_cache_hits_total counter",
         f"hermes_router_cache_hits_total {m['cache_hits_total']}",
         "",
-        "# HELP hermes_router_429_total Rate limit hits by tier",
+        "# HELP hermes_router_429_total Rate limit hits by category",
         "# TYPE hermes_router_429_total counter",
-        f"hermes_router_429_total{{tier=\"simple\"}} {m['429_simple']}",
-        f"hermes_router_429_total{{tier=\"complex\"}} {m['429_complex']}",
-        f"hermes_router_429_total {m['429_total']}",
-        "",
+    ]
+    for name in cats:
+        lines.append(f"hermes_router_429_total{{category=\"{name}\"}} {m.get(f'429_{name}', 0)}")
+    lines.append(f"hermes_router_429_total {m['429_total']}")
+    lines.append("")
+
+    lines += [
         "# HELP hermes_router_fallback_used_total Fallback tiers triggered",
         "# TYPE hermes_router_fallback_used_total counter",
         f"hermes_router_fallback_used_total{{level=\"1\"}} {m['fallback_used_total']}",

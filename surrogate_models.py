@@ -30,6 +30,7 @@ class SentenceTransformerVectorizer(BaseEstimator, TransformerMixin):
         self.batch_size = batch_size
         self._model = None
         self._cache: dict[str, np.ndarray] = {}
+        self._cache_max = 500  # max cached embeddings; LRU eviction
 
     def _load_model(self):
         if self._model is None:
@@ -64,6 +65,10 @@ class SentenceTransformerVectorizer(BaseEstimator, TransformerMixin):
                 normalize_embeddings=True,
             )
             for t, emb in zip(uncached, embeddings):
+                if len(self._cache) >= self._cache_max:
+                    # Evict oldest entry (insertion-order dict = FIFO)
+                    oldest = next(iter(self._cache))
+                    del self._cache[oldest]
                 self._cache[t] = emb
 
         return np.array([self._cache[t] for t in texts])

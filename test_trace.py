@@ -14,10 +14,9 @@ from __future__ import annotations
 
 import json
 import os
-import tempfile
 import time
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 
@@ -411,33 +410,36 @@ class TestServerTraceInstrumentation:
 
     @pytest.fixture
     def cfg(self):
-        """Minimal router config for testing."""
+        """Minimal router config for testing (multi-category format)."""
         return {
             "classifier": {
                 "model": "test-model",
                 "base_url": "http://localhost:11434/v1",
                 "api_key_env": "",
                 "session_timeout_minutes": 5,
-                "system_prompt": "Classify as simple or complex: {message}",
+                "system_prompt": "Classify into: {categories}\n\n{message}",
                 "profile_hint": "Test user",
             },
-            "models": {
-                "simple": {
-                    "model": "test-simple",
+            "categories": {
+                "chat": {
+                    "label": "Chat & Trivia",
+                    "model": "test-chat",
                     "base_url": "http://localhost:11434/v1",
-                    "api_key_env": "TEST_SIMPLE_KEY",
+                    "api_key_env": "TEST_CHAT_KEY",
                     "timeout_seconds": 30,
                 },
-                "complex": {
-                    "model": "test-complex",
+                "code": {
+                    "label": "Code & Debug",
+                    "model": "test-code",
                     "base_url": "http://localhost:11434/v1",
-                    "api_key_env": "TEST_COMPLEX_KEY",
+                    "api_key_env": "TEST_CODE_KEY",
                     "timeout_seconds": 30,
                 },
             },
             "routing": {
                 "escalation_keywords": ["debug", "implement", "deploy"],
                 "de_escalation_keywords": ["thanks", "hello"],
+                "override_prefix": "/use:",
             },
             "persona": {
                 "user_path": "/dev/null",
@@ -451,15 +453,15 @@ class TestServerTraceInstrumentation:
         """classify() should emit a trace_classify event."""
         collected = []
         with patch.object(server, "trace_classify", side_effect=lambda *a, **kw: collected.append(("classify", kw))):
-            with patch("server._call_classifier_raw", return_value="simple"):
+            with patch("server._call_classifier_raw", return_value="chat"):
                 with patch("server.build_classification_prompt", return_value="prompt"):
                     result = server.classify(cfg, "What time is it?", session_key="test1")
 
-        assert result == "simple"
+        assert result == "chat"
         assert len(collected) == 1
         kw = collected[0][1]
         assert kw["session_key"] == "test1"
-        assert kw["classifier_result"] == "simple"
+        assert kw["classifier_result"] == "chat"
         assert kw["is_first"] is True
 
     def test_has_deviation_emits_trace(self, cfg, trace_dir):
@@ -468,7 +470,7 @@ class TestServerTraceInstrumentation:
         def collect(*a, **kw):
             collected.append(("deviation", kw))
         with patch.object(server, "trace_deviation", side_effect=collect):
-            result = server.has_deviation(cfg, "Please debug this code", "simple", session_key="test2")
+            result = server.has_deviation(cfg, "Please debug this code", "chat", session_key="test2")
 
         assert result is True
         assert len(collected) == 1
@@ -476,8 +478,7 @@ class TestServerTraceInstrumentation:
         assert kw["session_key"] == "test2"
         assert kw["keyword"] == "debug"
         assert kw["direction"] == "escalation"
-        assert kw["previous_tier"] == "simple"
-        assert kw["new_tier"] == "complex"
+        assert kw["previous_tier"] == "chat"
 
     def test_de_escalation_emits_trace(self, cfg, trace_dir):
         """has_deviation() should emit trace for de-escalation."""
@@ -485,14 +486,14 @@ class TestServerTraceInstrumentation:
         def collect(*a, **kw):
             collected.append(("deviation", kw))
         with patch.object(server, "trace_deviation", side_effect=collect):
-            result = server.has_deviation(cfg, "Thanks for that!", "complex", session_key="test3")
+            result = server.has_deviation(cfg, "Thanks for that!", "code", session_key="test3")
 
         assert result is True
         assert len(collected) == 1
         kw = collected[0][1]
         assert kw["direction"] == "de_escalation"
-        assert kw["previous_tier"] == "complex"
-        assert kw["new_tier"] == "simple"
+        assert kw["previous_tier"] == "code"
+        assert kw["new_tier"] == "chat"
 
     def test_circuit_breaker_open_traces(self, cfg, trace_dir):
         """Circuit breaker opening should emit trace_circuit."""
