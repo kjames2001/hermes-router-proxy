@@ -60,6 +60,12 @@ from fastapi.responses import JSONResponse, StreamingResponse
 # Shared model classes — needed so joblib can deserialize embedding-based pipelines
 from surrogate_models import SentenceTransformerVectorizer  # noqa: F401
 
+# ── Zero-shot embedding classifier (optional, no LLM needed) ──────────────
+try:
+    from zero_shot_classifier import get_zero_shot
+except ImportError:
+    get_zero_shot = lambda cfg: None  # noqa: E731
+
 # ── Logging ─────────────────────────────────────────────────────────────────
 class JsonFormatter(logging.Formatter):
     """Structured JSON log formatter — one line per record."""
@@ -489,15 +495,42 @@ def classify(cfg: dict, user_message: str, *, session_key: str | None = None, is
     """
     Classify a user message into one of the configured categories.
 
-    Uses the TRACER-inspired acceptor gate:
-      1. Try ML surrogate first (fast, free, ~0.1ms)
-      2. If surrogate confidence >= threshold → use its prediction
-      3. If surrogate confidence < threshold → fall back to LLM classifier
+    Classification priority (cheapest first):
+      1. Zero-shot embedding classifier (~10ms, no LLM, no training)
+      2. ML surrogate (TRACER-inspired, ~0.1ms, needs trained model)
+      3. LLM classifier (slow, costs tokens, most accurate)
 
-    Falls back to LLM classifier entirely if no surrogate is loaded.
-    Returns the first category as safe default on any failure.
+    Falls back to the first category on any failure.
     """
     names = _category_names(cfg)
+
+    # ── Zero-shot embedding classifier (fastest, no LLM) ───────────────
+    zero_shot = get_zero_shot(cfg)
+    if zero_shot is not None:
+        label, confidence = zero_shot.classify(user_message)
+        if confidence >= zero_shot.confidence_threshold and label in names:
+            latency_ms = 10.0  # ~10ms for embedding + similarity
+            _record_classifier_latency(latency_ms)
+            log.info(
+                "Zero-shot classified: '%s' → %s (%.3f similarity, threshold %.2f)",
+                user_message[:60], label, confidence, zero_shot.confidence_threshold,
+            )
+            trace_classify(
+                session_key=session_key or "?",
+                user_message=user_message,
+                classifier_result=label,
+                classifier_raw=f"zero_shot:{confidence:.4f}",
+                latency_ms=latency_ms,
+                tier=label,
+                model=f"zero_shot/{zero_shot.model_name}",
+                is_first=is_first,
+            )
+            return label
+        else:
+            log.info(
+                "Zero-shot uncertain: '%s' (%.3f < %.2f) — deferring to next classifier",
+                user_message[:60], confidence, zero_shot.confidence_threshold,
+            )
 
     surrogate = _get_surrogate(cfg)
 
@@ -1648,6 +1681,16 @@ def _startup() -> None:
             log.info("      fallback: %s (%s)", c.get("fallback_model", "?"), c.get("fallback_base_url", "?"))
     if not cats:
         log.error("  No categories configured — router will fail on all requests")
+
+    # Zero-shot classifier status
+    zs_cfg = cfg.get("classifier", {}).get("zero_shot", {})
+    if zs_cfg.get("enabled"):
+        log.info("  Zero-shot classifier: enabled (model=%s, threshold=%.2f)",
+                 zs_cfg.get("model_name", "all-MiniLM-L6-v2"),
+                 zs_cfg.get("confidence_threshold", 0.35))
+    else:
+        log.info("  Zero-shot classifier: disabled")
+
     app.state.config = cfg
 
 
@@ -1698,6 +1741,10 @@ async def reload_config(request: Request):
     # Bug #20: Reset surrogate singleton so it reloads with new config
     global _surrogate
     _surrogate = None
+
+    # Reset zero-shot classifier singleton
+    import zero_shot_classifier as _zsc
+    _zsc._instance = None
 
     # Atomic swap
     request.app.state.config = new_cfg

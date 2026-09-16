@@ -34,6 +34,124 @@ classifier:
 
     '
   session_timeout_minutes: 5
+  zero_shot:
+    enabled: true
+    model_name: all-MiniLM-L6-v2
+    confidence_threshold: 0.1
+    descriptions:
+      chat:
+      - hello how are you
+      - thanks a lot
+      - what is this
+      - simple question
+      - good morning
+      - hi there
+      - bye see you
+      - ok got it
+      - what time is it
+      - what does it mean
+      - explain simply
+      - thanks
+      - hi
+      - hey
+      - hello
+      - good evening
+      - how are you doing
+      - what is the weather
+      - thanks for the help
+      - that makes sense
+      - got it thanks
+      - 你好
+      - 谢谢
+      - 早上好
+      - 再见
+      - 好的
+      code:
+      - write a python function
+      - debug this error
+      - fix this bug
+      - refactor this code
+      - implement a function
+      - create a class
+      - write unit tests
+      - code review this PR
+      - git commit and push
+      - fix the regex pattern
+      - handle exceptions in python
+      - implement oauth2 flow
+      - write a bash script
+      - create a decorator
+      - optimize this sql query
+      - write a typescript interface
+      - fix memory leak
+      - implement a cache
+      - write a dockerfile
+      - algorithm implementation
+      - data structure design
+      - merge conflict resolution
+      - pull request review
+      - async await refactor
+      - lambda function
+      - error traceback
+      devops:
+      - deploy to proxmox lxc
+      - configure nginx reverse proxy
+      - docker compose setup
+      - kubernetes deployment
+      - systemd service configuration
+      - ssl certificate certbot
+      - tailscale vpn setup
+      - ssh key management
+      - backup and restore
+      - proxmox snapshot
+      - firewall configuration
+      - caddy server setup
+      - github actions ci cd
+      - disk space full
+      - out of memory error
+      - permission denied
+      - connection refused
+      - 502 bad gateway
+      - docker container networking
+      - port forwarding
+      - infrastructure as code
+      - server configuration
+      research:
+      - compare different approaches
+      - research paper analysis
+      - literature review on
+      - benchmark evaluation
+      - academic study on
+      - survey of methods
+      - analyze the results
+      - evaluate performance
+      - methodology comparison
+      - statistical analysis
+      - arxiv paper summary
+      - citation analysis
+      - market research
+      - trend analysis
+      - data analysis report
+      - experiment results
+      homeassistant:
+      - home assistant automation
+      - create ha automation
+      - configure zigbee2mqtt
+      - esphome esp32 setup
+      - mqtt broker configuration
+      - smart home automation
+      - zha device pairing
+      - ha blueprint
+      - energy dashboard setup
+      - device tracker
+      - binary sensor template
+      - ha scene creation
+      - frigate integration ha
+      - motion sensor automation
+      - light automation
+      - thermostat control
+      - zigbee device
+      - home assistant script
 categories:
   chat:
     label: Chat & Trivia

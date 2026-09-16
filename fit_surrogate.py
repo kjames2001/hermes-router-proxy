@@ -123,7 +123,8 @@ def extract_classifier_traces(events: list[dict]) -> list[dict]:
             # Skip route, cache_hit, deviation, stream_error events
             continue
 
-        if not text or label not in ("simple", "complex"):
+        # Accept any non-empty label (multi-category: chat, code, devops, etc.)
+        if not text or not label:
             continue
 
         # Only use LLM-classifier traces as teacher labels (not surrogate's own predictions)
@@ -168,7 +169,7 @@ def fit_candidates(
     print(f"  Labels: {label_counts}")
 
     if len(label_counts) < 2:
-        print("  ERROR: Need at least 2 classes (simple + complex) to train.")
+        print("  ERROR: Need at least 2 categories to train a classifier.")
         print("  Collect more traces with diverse queries and re-run.")
         sys.exit(1)
 

@@ -6,8 +6,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-COPY server.py trace.py surrogate_models.py router_config.example.yaml ./
-RUN pip install --no-cache-dir fastapi uvicorn[standard] httpx pyyaml
+COPY server.py trace.py surrogate_models.py zero_shot_classifier.py router_config.example.yaml ./
+RUN pip install --no-cache-dir fastapi uvicorn[standard] httpx pyyaml scikit-learn sentence-transformers
 
 # ── Runtime ──────────────────────────────────────────────────────────────────
 FROM python:3.13-slim
@@ -18,6 +18,7 @@ COPY --from=builder /usr/local/lib/python3.13/site-packages /usr/local/lib/pytho
 COPY --from=builder /app/server.py /app/server.py
 COPY --from=builder /app/trace.py /app/trace.py
 COPY --from=builder /app/surrogate_models.py /app/surrogate_models.py
+COPY --from=builder /app/zero_shot_classifier.py /app/zero_shot_classifier.py
 
 # Default config (users should mount their own router_config.yaml over this)
 COPY router_config.example.yaml /app/router_config.yaml
