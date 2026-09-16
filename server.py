@@ -4,8 +4,15 @@ Hermes Model Router — hybrid flash-classifier + keyword-pipe proxy.
 
 Routes user messages to different models based on task category (chat,
 code, devops, research, homeassistant, etc.). Session-aware: classifies
-once with zero-shot embeddings or LLM, then uses sub-millisecond keyword
-deviation detection for follow-up messages.
+once with fastText, SetFit, zero-shot embeddings, surrogate, or LLM,
+then uses sub-millisecond keyword deviation detection for follow-up messages.
+
+Classification tiers (cheapest first):
+  0. fastText (<0.01ms, bag-of-words + n-grams)
+  1. SetFit (~10ms, fine-tuned sentence transformer)
+  2. Zero-shot embeddings (~10ms, cosine similarity, no training)
+  3. ML surrogate (~0.1ms, trained sklearn pipeline)
+  4. LLM classifier (slow, costs tokens, most accurate)
 
 OpenAI-compatible at POST /v1/chat/completions.
 Configuration: router_config.yaml (auto-detected alongside this file).
@@ -65,6 +72,18 @@ try:
     from zero_shot_classifier import get_zero_shot
 except ImportError:
     get_zero_shot = lambda cfg: None  # noqa: E731
+
+# ── fastText classifier (tier 0, ultra-fast, <0.01ms) ─────────────────────
+try:
+    from fasttext_classifier import get_fasttext
+except ImportError:
+    get_fasttext = lambda cfg: None  # noqa: E731
+
+# ── SetFit classifier (tier 1, ~10ms, fine-tuned sentence transformer) ────
+try:
+    from setfit_classifier import get_setfit
+except ImportError:
+    get_setfit = lambda cfg: None  # noqa: E731
 
 # ── Logging ─────────────────────────────────────────────────────────────────
 class JsonFormatter(logging.Formatter):
@@ -496,15 +515,73 @@ def classify(cfg: dict, user_message: str, *, session_key: str | None = None, is
     Classify a user message into one of the configured categories.
 
     Classification priority (cheapest first):
-      1. Zero-shot embedding classifier (~10ms, no LLM, no training)
-      2. ML surrogate (TRACER-inspired, ~0.1ms, needs trained model)
-      3. LLM classifier (slow, costs tokens, most accurate)
+      0. fastText classifier (<0.01ms, bag-of-words + n-grams, trained model)
+      1. SetFit classifier (~10ms, fine-tuned sentence transformer, trained model)
+      2. Zero-shot embedding classifier (~10ms, no training, cosine similarity)
+      3. ML surrogate (TRACER-inspired, ~0.1ms, needs trained model)
+      4. LLM classifier (slow, costs tokens, most accurate)
 
     Falls back to the first category on any failure.
     """
     names = _category_names(cfg)
 
-    # ── Zero-shot embedding classifier (fastest, no LLM) ───────────────
+    # ── Tier 0: fastText classifier (ultra-fast, <0.01ms) ──────────────
+    fasttext_clf = get_fasttext(cfg)
+    if fasttext_clf is not None:
+        label, confidence = fasttext_clf.classify(user_message)
+        if confidence >= fasttext_clf.confidence_threshold and label in names:
+            latency_ms = 0.01
+            _record_classifier_latency(latency_ms)
+            log.info(
+                "fastText classified: '%s' → %s (%.3f prob, threshold %.2f)",
+                user_message[:60], label, confidence, fasttext_clf.confidence_threshold,
+            )
+            trace_classify(
+                session_key=session_key or "?",
+                user_message=user_message,
+                classifier_result=label,
+                classifier_raw=f"fasttext:{confidence:.4f}",
+                latency_ms=latency_ms,
+                tier=label,
+                model="fasttext/quantized",
+                is_first=is_first,
+            )
+            return label
+        else:
+            log.info(
+                "fastText uncertain: '%s' (%.3f < %.2f) — deferring to next classifier",
+                user_message[:60], confidence, fasttext_clf.confidence_threshold,
+            )
+
+    # ── Tier 1: SetFit classifier (~10ms, fine-tuned) ──────────────────
+    setfit_clf = get_setfit(cfg)
+    if setfit_clf is not None:
+        label, confidence = setfit_clf.classify(user_message)
+        if confidence >= setfit_clf.confidence_threshold and label in names:
+            latency_ms = 10.0
+            _record_classifier_latency(latency_ms)
+            log.info(
+                "SetFit classified: '%s' → %s (%.3f prob, threshold %.2f)",
+                user_message[:60], label, confidence, setfit_clf.confidence_threshold,
+            )
+            trace_classify(
+                session_key=session_key or "?",
+                user_message=user_message,
+                classifier_result=label,
+                classifier_raw=f"setfit:{confidence:.4f}",
+                latency_ms=latency_ms,
+                tier=label,
+                model="setfit/all-MiniLM-L6-v2",
+                is_first=is_first,
+            )
+            return label
+        else:
+            log.info(
+                "SetFit uncertain: '%s' (%.3f < %.2f) — deferring to next classifier",
+                user_message[:60], confidence, setfit_clf.confidence_threshold,
+            )
+
+    # ── Tier 2: Zero-shot embedding classifier (no LLM) ───────────────
     zero_shot = get_zero_shot(cfg)
     if zero_shot is not None:
         label, confidence = zero_shot.classify(user_message)
@@ -532,6 +609,7 @@ def classify(cfg: dict, user_message: str, *, session_key: str | None = None, is
                 user_message[:60], confidence, zero_shot.confidence_threshold,
             )
 
+    # ── Tier 3: ML surrogate (TRACER-inspired, ~0.1ms, trained model) ──
     surrogate = _get_surrogate(cfg)
 
     if surrogate is not None:
@@ -564,7 +642,7 @@ def classify(cfg: dict, user_message: str, *, session_key: str | None = None, is
                 user_message[:60], confidence, surrogate.confidence_threshold,
             )
 
-    # ── LLM classifier (slow path or no surrogate) ─────────────────────
+    # ── Tier 4: LLM classifier (slow path, costs tokens, most accurate) ──
     t0 = time.time()
     prompt = build_classification_prompt(cfg, user_message)
     result = _call_classifier_raw(cfg, prompt, max_tokens=256)
@@ -1685,6 +1763,24 @@ def _startup() -> None:
     else:
         log.info("  Zero-shot classifier: disabled")
 
+    # fastText classifier status
+    ft_cfg = cfg.get("classifier", {}).get("fasttext", {})
+    if ft_cfg.get("enabled"):
+        log.info("  fastText classifier: enabled (model=%s, threshold=%.2f)",
+                 ft_cfg.get("model_path", ".router/fasttext/model.ftz"),
+                 ft_cfg.get("confidence_threshold", 0.85))
+    else:
+        log.info("  fastText classifier: disabled")
+
+    # SetFit classifier status
+    sf_cfg = cfg.get("classifier", {}).get("setfit", {})
+    if sf_cfg.get("enabled"):
+        log.info("  SetFit classifier: enabled (model=%s, threshold=%.2f)",
+                 sf_cfg.get("model_path", ".router/setfit"),
+                 sf_cfg.get("confidence_threshold", 0.55))
+    else:
+        log.info("  SetFit classifier: disabled")
+
     app.state.config = cfg
 
 
@@ -1843,6 +1939,8 @@ def _build_classifier_report(cfg: dict) -> dict:
             pass
 
     # ── Classify events ─────────────────────────────────────────────────
+    fasttext_hits = 0
+    setfit_hits = 0
     zero_shot_hits = 0
     surrogate_hits = 0
     llm_hits = 0
@@ -1855,7 +1953,7 @@ def _build_classifier_report(cfg: dict) -> dict:
     fallback1_events = 0
     fallback2_events = 0
     # Per-hour surrogate hit rate for drift detection
-    hourly_surrogate: dict[str, dict[str, int]] = {}  # hour → {surrogate, llm}
+    hourly_surrogate: dict[str, dict[str, int]] = {}  # hour → {non_llm, llm}
 
     for ev in events:
         etype = ev.get("event", "")
@@ -1864,7 +1962,11 @@ def _build_classifier_report(cfg: dict) -> dict:
             model = ev.get("model", "")
             raw = ev.get("classifier_raw", "")
             
-            if model.startswith("surrogate/"):
+            if model.startswith("fasttext/"):
+                fasttext_hits += 1
+            elif model.startswith("setfit/"):
+                setfit_hits += 1
+            elif model.startswith("surrogate/"):
                 surrogate_hits += 1
                 # Extract confidence from raw like "surrogate:0.87"
                 try:
@@ -1881,11 +1983,9 @@ def _build_classifier_report(cfg: dict) -> dict:
             ts = ev.get("ts", "")
             hour_key = ts[:13] if len(ts) >= 13 else "unknown"  # "2026-05-13T16"
             if hour_key not in hourly_surrogate:
-                hourly_surrogate[hour_key] = {"surrogate": 0, "llm": 0}
-            if model.startswith("surrogate/"):
-                hourly_surrogate[hour_key]["surrogate"] += 1
-            elif model.startswith("zero_shot/"):
-                hourly_surrogate[hour_key]["surrogate"] += 1  # count as non-LLM
+                hourly_surrogate[hour_key] = {"non_llm": 0, "llm": 0}
+            if model.startswith(("fasttext/", "setfit/", "surrogate/", "zero_shot/")):
+                hourly_surrogate[hour_key]["non_llm"] += 1
             else:
                 hourly_surrogate[hour_key]["llm"] += 1
 
@@ -1908,8 +2008,8 @@ def _build_classifier_report(cfg: dict) -> dict:
         elif etype == "stream_error":
             stream_errors += 1
 
-    total_classifications = zero_shot_hits + surrogate_hits + llm_hits
-    non_llm_hits = zero_shot_hits + surrogate_hits
+    total_classifications = fasttext_hits + setfit_hits + zero_shot_hits + surrogate_hits + llm_hits
+    non_llm_hits = fasttext_hits + setfit_hits + zero_shot_hits + surrogate_hits
     sur_coverage = (non_llm_hits / total_classifications * 100) if total_classifications > 0 else 0
 
     # Confidence distribution
@@ -1926,10 +2026,10 @@ def _build_classifier_report(cfg: dict) -> dict:
     drift_hours = []
     for hour_key in sorted(hourly_surrogate.keys()):
         h = hourly_surrogate[hour_key]
-        total_h = h["surrogate"] + h["llm"]
+        total_h = h["non_llm"] + h["llm"]
         drift_hours.append({
             "hour": hour_key,
-            "surrogate_pct": round(h["surrogate"] / total_h * 100, 1) if total_h > 0 else 0,
+            "non_llm_pct": round(h["non_llm"] / total_h * 100, 1) if total_h > 0 else 0,
             "total_classifications": total_h,
         })
 
@@ -1954,6 +2054,8 @@ def _build_classifier_report(cfg: dict) -> dict:
             "threshold": sur_info.get("confidence_threshold", None),
         },
         "classification_sources": {
+            "fasttext": fasttext_hits,
+            "setfit": setfit_hits,
             "zero_shot": zero_shot_hits,
             "surrogate": surrogate_hits,
             "llm_classifier": llm_hits,

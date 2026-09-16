@@ -73,7 +73,7 @@ echo "  Running smoke test..."
 API_KEY="${ROUTER_PROXY_API_KEY:-$(grep ROUTER_PROXY_API_KEY /root/.hermes/.env | cut -d= -f2 | tr -d '\"' | tr -d "'")}"
 RESPONSE=$(curl -s --max-time 15 -X POST http://localhost:8766/v1/chat/completions \
     -H "Content-Type: application/json" \
-    -H "Authorization: Bearer $API_KEY" \
+    -H "Authorization: Bearer ${API_KEY}"
     -d '{"model":"deepseek-v4-flash","messages":[{"role":"user","content":"Hello"}],"max_tokens":10,"stream":false}' 2>/dev/null || echo "FAILED")
 
 if echo "$RESPONSE" | grep -q '"choices"'; then

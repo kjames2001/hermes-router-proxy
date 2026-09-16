@@ -2,6 +2,14 @@ classifier:
   model: GLM-4.7-Flash-MXFP4_MOE
   base_url: http://docker-ssd:8002/v1
   api_key_env: ''
+  fasttext:
+    enabled: true
+    model_path: .router/fasttext/model.ftz
+    confidence_threshold: 0.90
+  setfit:
+    enabled: true
+    model_path: .router/setfit
+    confidence_threshold: 0.55
   surrogate:
     enabled: true
     path: .router/surrogate
