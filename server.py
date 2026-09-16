@@ -2,9 +2,9 @@
 """
 Hermes Model Router — hybrid flash-classifier + keyword-pipe proxy.
 
-Routes simple queries (chat, quick questions) to cheap models and complex
-queries (coding, system administration) to capable models. Session-aware:
-classifies once with a flash model, then uses sub-millisecond keyword
+Routes user messages to different models based on task category (chat,
+code, devops, research, homeassistant, etc.). Session-aware: classifies
+once with zero-shot embeddings or LLM, then uses sub-millisecond keyword
 deviation detection for follow-up messages.
 
 OpenAI-compatible at POST /v1/chat/completions.
@@ -217,8 +217,8 @@ def _extract_profile_hint(cfg: dict) -> str:
 
     prompt = (
         "Summarize this AI agent's user identity, environment, and key tools "
-        "in 2–3 concise sentences. Keep only what helps classify tasks as 'simple' "
-        f"or 'complex'.\n\n{raw}"
+        "in 2-3 concise sentences. Keep only what helps classify tasks into "
+        f"the configured categories.\n\n{raw}"
     )
 
     log.info("Extracting profile hint from USER.md+MEMORY.md (%d chars) → flash model", len(raw))
@@ -373,7 +373,7 @@ class SurrogateClassifier:
         Falls back to ("simple", 0.0) on any error.
         """
         if not self._loaded or self.pipeline is None:
-            return "simple", 0.0
+            return "", 0.0
 
         try:
             # Pipeline prediction
@@ -394,7 +394,7 @@ class SurrogateClassifier:
 
         except Exception as exc:
             log.warning("Surrogate predict error: %s", exc)
-            return "simple", 0.0
+            return "", 0.0
 
 
 # ── Global surrogate instance (lazy-loaded) ─────────────────────────────────
@@ -665,16 +665,13 @@ def has_deviation(cfg: dict, text: str, current_category: str, *, session_key: s
     for kw in cfg["routing"].get("escalation_keywords", []):
         if _fuzzy_match(kw, text):
             log.info("Deviation: escalation keyword '%s' matched", kw)
-            names = _category_names(cfg)
-            new_cat = names[0] if names else "chat"
-            model = cfg["categories"].get(new_cat, {}).get("model", "unknown")
             trace_deviation(
                 session_key=session_key or "?",
                 keyword=kw,
                 direction="escalation",
                 previous_tier=current_category,
-                new_tier=new_cat,
-                model=model,
+                new_tier="unknown",  # actual tier determined by re-classification in caller
+                model="unknown",
             )
             return True
 
@@ -701,7 +698,7 @@ def has_deviation(cfg: dict, text: str, current_category: str, *, session_key: s
 
 # ── Session Cache ───────────────────────────────────────────────────────────
 
-# In-memory: session_key → {"tier": "simple"|"complex", "at": timestamp}
+# In-memory: session_key → {"tier": <category_name>, "at": timestamp}
 SESSIONS: dict[str, dict[str, Any]] = {}
 SESSIONS_MAX = 500  # max cached sessions; oldest evicted on insert
 
@@ -806,9 +803,9 @@ def _circuit_record_failure(cfg: dict, base_url: str, model: str = "") -> None:
 
 
 def _inc_metric(name: str, delta: int = 1) -> None:
-    """Increment a metric counter atomically (single-threaded safe)."""
-    if name in METRICS:
-        METRICS[name] += delta
+    """Increment a metric counter atomically (single-threaded safe).
+    Auto-creates keys for dynamic per-category metrics."""
+    METRICS[name] = METRICS.get(name, 0) + delta
 
 
 def _inc_metric_tier(tier: str, name: str, delta: int = 1) -> None:
@@ -937,12 +934,9 @@ async def _post_with_retry(
                             "%s exhausted %s retries: %s", label, _RETRY_MAX + 1, exc
                         )
             raise last_exc  # type: ignore[misc]
-    except _RETRYABLE_EXC:
+    except Exception:
         raise
-    except Exception as exc:
-        if last_exc and isinstance(exc, type(last_exc)):
-            raise
-        raise
+
 
 async def call_model(
     cfg: dict, model_cfg: dict, request_payload: dict
@@ -1272,7 +1266,7 @@ async def route_request_stream(cfg: dict, payload: dict):
                             trace_route(
                                 session_key=key, tier=category, model=model_name,
                                 upstream_status=429, stream=True,
-                                fallback_level=tier_attempts.index((attempt_label, attempt_cfg)) + 1,
+                                fallback_level=attempt_idx + 1,
                             )
                             break  # both keys 429'd, try next tier
 
@@ -1849,6 +1843,7 @@ def _build_classifier_report(cfg: dict) -> dict:
             pass
 
     # ── Classify events ─────────────────────────────────────────────────
+    zero_shot_hits = 0
     surrogate_hits = 0
     llm_hits = 0
     cache_hits_events = 0
@@ -1877,8 +1872,8 @@ def _build_classifier_report(cfg: dict) -> dict:
                     surrogate_confidences.append(conf)
                 except (ValueError, IndexError):
                     pass
-                # Drift: check if surrogate agrees with what the LLM would say
-                # We track this via the tier field
+            elif model.startswith("zero_shot/"):
+                zero_shot_hits += 1
             else:
                 llm_hits += 1
 
@@ -1889,6 +1884,8 @@ def _build_classifier_report(cfg: dict) -> dict:
                 hourly_surrogate[hour_key] = {"surrogate": 0, "llm": 0}
             if model.startswith("surrogate/"):
                 hourly_surrogate[hour_key]["surrogate"] += 1
+            elif model.startswith("zero_shot/"):
+                hourly_surrogate[hour_key]["surrogate"] += 1  # count as non-LLM
             else:
                 hourly_surrogate[hour_key]["llm"] += 1
 
@@ -1911,8 +1908,9 @@ def _build_classifier_report(cfg: dict) -> dict:
         elif etype == "stream_error":
             stream_errors += 1
 
-    total_classifications = surrogate_hits + llm_hits
-    sur_coverage = (surrogate_hits / total_classifications * 100) if total_classifications > 0 else 0
+    total_classifications = zero_shot_hits + surrogate_hits + llm_hits
+    non_llm_hits = zero_shot_hits + surrogate_hits
+    sur_coverage = (non_llm_hits / total_classifications * 100) if total_classifications > 0 else 0
 
     # Confidence distribution
     conf_buckets = {"high_ge0.9": 0, "med_0.7_0.9": 0, "low_lt0.7": 0}
@@ -1956,6 +1954,7 @@ def _build_classifier_report(cfg: dict) -> dict:
             "threshold": sur_info.get("confidence_threshold", None),
         },
         "classification_sources": {
+            "zero_shot": zero_shot_hits,
             "surrogate": surrogate_hits,
             "llm_classifier": llm_hits,
             "cache_hits": cache_hits_events,
@@ -2035,6 +2034,7 @@ code {{ background: #21262d; padding: 2px 6px; border-radius: 4px; }}
 <h3>Classification Sources</h3>
 <table>
 <tr><th>Source</th><th>Count</th></tr>
+<tr><td>🔮 Zero-shot</td><td>{sources['zero_shot']}</td></tr>
 <tr><td>🤖 Surrogate</td><td>{sources['surrogate']}</td></tr>
 <tr><td>🧠 LLM Classifier</td><td>{sources['llm_classifier']}</td></tr>
 <tr><td>📦 Cache Hits</td><td>{sources['cache_hits']}</td></tr>

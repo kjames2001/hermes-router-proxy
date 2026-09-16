@@ -167,7 +167,7 @@ def generate_samples(
         labeled += 1
 
     # Also use the teacher model to cross-validate labels on a subset
-    print(f"  Cross-validating labels with teacher model...")
+    print("  Cross-validating labels with teacher model...")
     cross_val_count = 0
     for sample in random.sample(samples, min(50, len(samples))):
         prompt = build_classification_prompt(categories, sample["text"])
@@ -250,7 +250,7 @@ def main():
     teacher_url = args.teacher or cfg["classifier"]["base_url"]
     teacher_model = args.teacher_model or cfg["classifier"]["model"]
 
-    print(f"\n  Pre-training Surrogate Classifier")
+    print("\n  Pre-training Surrogate Classifier")
     print(f"  {'='*60}")
     print(f"  Teacher: {teacher_model} ({teacher_url})")
     print(f"  Categories: {list(categories.keys())}")
@@ -287,7 +287,7 @@ def main():
         print(f"  Saved {len(samples)} samples to {trace_file}")
 
     # ── Fit the surrogate ──────────────────────────────────────────────
-    print(f"\n  Fitting surrogate model...")
+    print("\n  Fitting surrogate model...")
     print(f"  {'='*60}")
 
     # Import and run fit_surrogate.py's fitting logic
@@ -310,19 +310,19 @@ def main():
     # Detect teacher model
     teacher = teacher_model
 
-    manifest = fit_candidates(
+    fit_candidates(
         texts, labels,
         target_agreement=0.90,
         teacher_model=teacher,
         prefer_embeddings=True,
     )
 
-    print(f"\n  Pre-training Complete!")
+    print("\n  Pre-training Complete!")
     print(f"  {'='*60}")
-    print(f"  The surrogate is now available at .router/surrogate/")
-    print(f"  Enable it in router_config.yaml: classifier.surrogate.enabled: true")
-    print(f"  The router will use the surrogate for confident predictions")
-    print(f"  and fall back to zero-shot / LLM only for uncertain ones.")
+    print("  The surrogate is now available at .router/surrogate/")
+    print("  Enable it in router_config.yaml: classifier.surrogate.enabled: true")
+    print("  The router will use the surrogate for confident predictions")
+    print("  and fall back to zero-shot / LLM only for uncertain ones.")
 
 
 if __name__ == "__main__":
