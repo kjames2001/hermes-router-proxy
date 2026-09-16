@@ -1,67 +1,42 @@
-# ═══════════════════════════════════════════════════════════════════════════
-# Hermes Router Proxy Configuration — Multi-Category Edition
-# ═══════════════════════════════════════════════════════════════════════════
-#
-# Define any number of task categories. Each category maps to a model
-# with its own fallback chain. The classifier auto-detects the category
-# from the user's message. Users can override with /use:<category-name>.
-#
-# Structure:
-#   categories:
-#     <name>:                    # lowercase, no spaces — used as the routing key
-#       label: "Human label"      # for logs and reports
-#       model: <model-name>
-#       base_url: <endpoint>
-#       api_key_env: <ENV_VAR>
-#       ...fallback fields...
-#
-# The classifier sees all category names + labels and picks one.
-# The /use:<name> override skips classification entirely.
-# ═══════════════════════════════════════════════════════════════════════════
-
 classifier:
-  # Model used for classification (should be fast/cheap)
-  model: qwen2.5-0.5b-instruct-q8_0
-  base_url: http://docker-ssd:8003/v1
-  api_key_env: ROUTER_PROXY_LOCAL_KEY
-
-  # ML surrogate (optional — replaces LLM classifier for confident predictions)
+  model: GLM-4.7-Flash-MXFP4_MOE
+  base_url: http://docker-ssd:8002/v1
+  api_key_env: ''
   surrogate:
     enabled: true
     path: .router/surrogate
     confidence_threshold: 0.85
+  profile_hint: simple
+  system_prompt: 'Classify the user''s message into exactly one of these categories:
 
-  # Profile hint — auto-extracted from USER.md + MEMORY.md on first run.
-  # Leave empty to trigger lazy extraction. Set manually to skip extraction.
-  profile_hint: ""
-
-  # System prompt — {categories} is replaced with category list,
-  # {message} is replaced with the user's message.
-  system_prompt: |
-    Classify the user's message into exactly one of these categories:
     {categories}
 
+
     Examples:
+
     "Hello" → chat
+
     "Write a Python function" → code
+
     "Deploy to Proxmox" → devops
+
     "What is quantum computing?" → research
+
     "Thanks!" → chat
+
     "Debug nginx 502" → code
+
 
     Reply with ONLY the category name, nothing else.
 
+
     "{message}" →
 
+    '
   session_timeout_minutes: 5
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Task Categories — define as many as you need
-# ═══════════════════════════════════════════════════════════════════════════
 categories:
-  # ── Casual chat, greetings, simple Q&A ──────────────────────────────
   chat:
-    label: "Chat & Trivia"
+    label: Chat & Trivia
     model: deepseek-v4-flash
     base_url: https://ollama.com/v1
     api_key_env: OLLAMA_API_KEY_2
@@ -71,10 +46,8 @@ categories:
     fallback_base_url: https://api.deepseek.com/v1
     fallback_key_env: DEEPSEEK_API_KEY
     fallback_alternate_key_env: DEEPSEEK_API_KEY
-
-  # ── Coding, debugging, architecture, technical work ─────────────────
   code:
-    label: "Code & Debug"
+    label: Code & Debug
     model: deepseek-v4-pro
     base_url: https://ollama.com/v1
     api_key_env: OLLAMA_API_KEY
@@ -84,10 +57,8 @@ categories:
     fallback_base_url: https://api.deepseek.com/v1
     fallback_key_env: DEEPSEEK_API_KEY
     fallback_alternate_key_env: DEEPSEEK_API_KEY
-
-  # ── DevOps, deployment, infrastructure, system admin ─────────────────
   devops:
-    label: "DevOps & Infra"
+    label: DevOps & Infra
     model: deepseek-v4-pro
     base_url: https://ollama.com/v1
     api_key_env: OLLAMA_API_KEY
@@ -97,10 +68,8 @@ categories:
     fallback_base_url: https://api.deepseek.com/v1
     fallback_key_env: DEEPSEEK_API_KEY
     fallback_alternate_key_env: DEEPSEEK_API_KEY
-
-  # ── Research, deep analysis, academic questions ─────────────────────
   research:
-    label: "Research & Analysis"
+    label: Research & Analysis
     model: deepseek-v4-pro
     base_url: https://ollama.com/v1
     api_key_env: OLLAMA_API_KEY
@@ -110,10 +79,8 @@ categories:
     fallback_base_url: https://api.deepseek.com/v1
     fallback_key_env: DEEPSEEK_API_KEY
     fallback_alternate_key_env: DEEPSEEK_API_KEY
-
-  # ── Home Assistant, smart home, automations ──────────────────────────
   homeassistant:
-    label: "Home Assistant"
+    label: Home Assistant
     model: deepseek-v4-flash
     base_url: https://ollama.com/v1
     api_key_env: OLLAMA_API_KEY_2
@@ -123,186 +90,149 @@ categories:
     fallback_base_url: https://api.deepseek.com/v1
     fallback_key_env: DEEPSEEK_API_KEY
     fallback_alternate_key_env: DEEPSEEK_API_KEY
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Keyword Deviation — escalation and de-escalation between categories
-# ═══════════════════════════════════════════════════════════════════════════
-# When a follow-up message contains an escalation keyword, the router
-# re-classifies instead of using the cached category.
-# Keywords are matched against the current category to decide if
-# re-classification is needed.
 routing:
-  # Keywords that trigger re-classification (any category → re-evaluate)
   escalation_keywords:
-    - implement
-    - refactor
-    - build
-    - write code
-    - generate code
-    - code review
-    - write tests
-    - debug
-    - troubleshoot
-    - diagnose
-    - fix this
-    - fix the
-    - fix error
-    - not working
-    - why isn't
-    - error
-    - crash
-    - exception
-    - traceback
-    - stack trace
-    - 502
-    - 500 error
-    - 503
-    - connection refused
-    - timeout
-    - permission denied
-    - OOM
-    - out of memory
-    - disk full
-    - deploy
-    - configure
-    - set up
-    - setup
-    - proxmox
-    - LXC
-    - container
-    - dockerfile
-    - docker-compose
-    - docker compose
-    - kubernetes
-    - k8s
-    - systemd service
-    - systemctl
-    - firewall
-    - nginx
-    - caddy
-    - certbot
-    - tailscale
-    - wireguard
-    - VPN
-    - SSH key
-    - backup
-    - restore backup
-    - architect
-    - architecture
-    - design a
-    - optimize
-    - performance
-    - database schema
-    - SQL
-    - migration
-    - fine-tune
-    - training
-    - model
-    - inference
-    - quantize
-    - GGUF
-    - LoRA
-    - vLLM
-    - Ollama
-    - Home Assistant
-    - HA automation
-    - ESPHome
-    - zigbee
-    - MQTT
-
-  # Keywords that signal the task is wrapping up (any category → chat)
+  - implement
+  - refactor
+  - build
+  - write code
+  - generate code
+  - code review
+  - write tests
+  - debug
+  - troubleshoot
+  - diagnose
+  - fix this
+  - fix the
+  - fix error
+  - not working
+  - why isn't
+  - error
+  - crash
+  - exception
+  - traceback
+  - stack trace
+  - 502
+  - 500 error
+  - 503
+  - connection refused
+  - timeout
+  - permission denied
+  - OOM
+  - out of memory
+  - disk full
+  - deploy
+  - configure
+  - set up
+  - setup
+  - proxmox
+  - LXC
+  - container
+  - dockerfile
+  - docker-compose
+  - docker compose
+  - kubernetes
+  - k8s
+  - systemd service
+  - systemctl
+  - firewall
+  - nginx
+  - caddy
+  - certbot
+  - tailscale
+  - wireguard
+  - VPN
+  - SSH key
+  - backup
+  - restore backup
+  - architect
+  - architecture
+  - design a
+  - optimize
+  - performance
+  - database schema
+  - SQL
+  - migration
+  - fine-tune
+  - training
+  - model
+  - inference
+  - quantize
+  - GGUF
+  - LoRA
+  - vLLM
+  - Ollama
+  - Home Assistant
+  - HA automation
+  - ESPHome
+  - zigbee
+  - MQTT
   de_escalation_keywords:
-    - thanks
-    - thank you
-    - thx
-    - got it
-    - understood
-    - makes sense
-    - perfect
-    - good job
-    - nice
-    - cool
-    - awesome
-    - great
-    - cheers
-    - "谢谢"
-    - "谢谢"
-    - "明白了"
-    - "懂了"
-    - "好的"
-    - "可以"
-    - "不错"
-    - "好"
-    - "行"
-    - "嗯"
-    - "哦"
-    - good morning
-    - good afternoon
-    - good evening
-    - hello
-    - hey
-    - hi
-    - how are you
-    - what's up
-    - bye
-    - goodbye
-    - see you
-    - "早上好"
-    - "你好"
-    - "嗨"
-    - "再见"
-    - "拜拜"
-    - ok
-    - okay
-    - sure
-    - alright
-    - yep
-    - yeah
-    - nope
-    - lol
-    - haha
-    - "哈哈"
-    - "呵呵"
-
-  # ── Manual override ───────────────────────────────────────────────────
-  # User types /use:<category> to force a specific category for the session.
-  # e.g. "/use:code Write a script to..." forces the code model.
-  # The override is cached for the session — subsequent messages stay
-  # on the forced category until the session expires.
-  override_prefix: "/use:"
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Auth
-# ═══════════════════════════════════════════════════════════════════════════
+  - thanks
+  - thank you
+  - thx
+  - got it
+  - understood
+  - makes sense
+  - perfect
+  - good job
+  - nice
+  - cool
+  - awesome
+  - great
+  - cheers
+  - 谢谢
+  - 谢谢
+  - 明白了
+  - 懂了
+  - 好的
+  - 可以
+  - 不错
+  - 好
+  - 行
+  - 嗯
+  - 哦
+  - good morning
+  - good afternoon
+  - good evening
+  - hello
+  - hey
+  - hi
+  - how are you
+  - what's up
+  - bye
+  - goodbye
+  - see you
+  - 早上好
+  - 你好
+  - 嗨
+  - 再见
+  - 拜拜
+  - ok
+  - okay
+  - sure
+  - alright
+  - yep
+  - yeah
+  - nope
+  - lol
+  - haha
+  - 哈哈
+  - 呵呵
+  override_prefix: '/use:'
 auth:
   api_key_env: ROUTER_PROXY_API_KEY
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Server
-# ═══════════════════════════════════════════════════════════════════════════
 server:
   port: 8766
   host: 0.0.0.0
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Persona (for profile hint extraction)
-# ═══════════════════════════════════════════════════════════════════════════
 persona:
   user_path: /root/.hermes/memories/USER.md
   memory_path: /root/.hermes/memories/MEMORY.md
   max_context_chars: 800
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Circuit Breaker
-# ═══════════════════════════════════════════════════════════════════════════
 circuit_breaker:
   failure_threshold: 3
   recovery_timeout_sec: 30
   window_sec: 60
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Tracing
-# ═══════════════════════════════════════════════════════════════════════════
 tracing:
   enabled: true
   path: .router/traces.jsonl

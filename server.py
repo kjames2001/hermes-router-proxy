@@ -252,24 +252,28 @@ def _call_classifier_raw(
         )
         if resp.status_code != 200:
             log.warning("Classifier returned HTTP %d: %s", resp.status_code, resp.text[:200])
-            return "simple"
+            cat_names = _category_names(cfg)
+            return cat_names[0] if cat_names else "chat"
         data = resp.json()
         msg = data["choices"][0]["message"]
         content = (msg.get("content") or "").strip().lower()
         # Reasoning models may put the answer in reasoning_content instead
         if not content:
             reasoning = (msg.get("reasoning_content") or "")
-            # Extract last meaningful word from reasoning
+            # Scan for any category name from config
+            cat_names = _category_names(cfg)
             parts = reasoning.lower().strip().split()
             for word in reversed(parts):
                 cleaned = word.strip('.,;:!?"\'()')
-                if cleaned in ("simple", "complex"):
+                if cleaned in cat_names:
                     content = cleaned
                     break
-        return content or "simple"
+        cat_names = _category_names(cfg)
+        return content or (cat_names[0] if cat_names else "chat")
     except Exception as exc:
         log.warning("Classifier call failed: %s", exc)
-        return "simple"
+        cat_names = _category_names(cfg)
+        return cat_names[0] if cat_names else "chat"
 
 
 def _write_config_back(cfg: dict) -> None:
@@ -530,7 +534,7 @@ def classify(cfg: dict, user_message: str, *, session_key: str | None = None, is
     # ── LLM classifier (slow path or no surrogate) ─────────────────────
     t0 = time.time()
     prompt = build_classification_prompt(cfg, user_message)
-    result = _call_classifier_raw(cfg, prompt, max_tokens=32)
+    result = _call_classifier_raw(cfg, prompt, max_tokens=256)
     latency_ms = (time.time() - t0) * 1000
     _record_classifier_latency(latency_ms)
 
